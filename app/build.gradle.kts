@@ -323,7 +323,7 @@ dependencies {
     // Unit Testing dependencies
     testImplementation("junit:junit:4.13.2")
     testImplementation("com.google.truth:truth:1.4.2")
-    testImplementation("org.robolectric:robolectric:4.12.2")
+    testImplementation("org.robolectric:robolectric:4.17")
     testImplementation("io.mockk:mockk:1.13.10")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
 
