@@ -176,7 +176,7 @@ class MusicPlaybackService : MediaBrowserServiceCompat() {
 
         createNotificationChannel()
         runCatching {
-            val session = MediaSessionCompat(this, "LastWavePlayer").apply {
+            val session = MediaSessionCompat(this, "AuraPlayer").apply {
                 setFlags(
                     MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS or
                         MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS,
@@ -624,7 +624,7 @@ class MusicPlaybackService : MediaBrowserServiceCompat() {
                 Notification.Builder(this, CHANNEL_ID)
             } else {
                 @Suppress("DEPRECATION") Notification.Builder(this)
-            }.setSmallIcon(R.drawable.ic_launcher_logo)
+            }.setSmallIcon(R.drawable.ic_aura_logo_mono)
              .setContentTitle(musicPlayer.state.value.current?.title ?: "Aura")
              .setContentText(musicPlayer.state.value.current?.artist ?: "Music player")
              .setOnlyAlertOnce(true)
@@ -1347,7 +1347,7 @@ class MusicPlaybackService : MediaBrowserServiceCompat() {
             // so the play action always reads the actual current state.
             val playPauseLabel = if (state.isPlaying) "Pause" else "Play"
             return builder
-                .setSmallIcon(R.drawable.ic_launcher_logo)
+                .setSmallIcon(R.drawable.ic_aura_logo_mono)
                 .setContentTitle(state.current?.title ?: "Aura")
                 .setContentText(state.current?.artist ?: "Music player")
                 .setSubText(state.current?.album)
@@ -1365,7 +1365,7 @@ class MusicPlaybackService : MediaBrowserServiceCompat() {
                 .addAction(Notification.Action.Builder(R.drawable.ic_widget_skip_next, "Next", serviceAction(ACTION_NEXT, 3)).build())
                 .addAction(Notification.Action.Builder(R.drawable.ic_widget_shuffle, if (state.shuffleEnabled) "Shuffle on" else "Shuffle off", serviceAction(ACTION_SHUFFLE, 5)).build())
                 .addAction(Notification.Action.Builder(repeatIcon, repeatLabel, serviceAction(ACTION_REPEAT, 6)).build())
-                .addAction(Notification.Action.Builder(android.R.drawable.ic_menu_close_clear_cancel, "Stop", serviceAction(ACTION_STOP, 4)).build())
+
                 .setColorized(true)
                 .apply {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -1411,7 +1411,7 @@ class MusicPlaybackService : MediaBrowserServiceCompat() {
         }
 
         return builder
-            .setSmallIcon(R.drawable.ic_launcher_logo)
+            .setSmallIcon(R.drawable.ic_aura_logo_mono)
             .setContentTitle(state.current?.title ?: "Aura")
             .setContentText(state.current?.artist ?: "Music player")
             .setSubText(state.current?.album)
@@ -1605,9 +1605,10 @@ class MusicPlaybackService : MediaBrowserServiceCompat() {
             // (DEFAULT without sound/vibration) replaces earlier channels outright.
             runCatching { nm.deleteNotificationChannel(LEGACY_CHANNEL_ID) }
             runCatching { nm.deleteNotificationChannel(LEGACY_CHANNEL_ID_V1) }
+            runCatching { nm.deleteNotificationChannel(LEGACY_CHANNEL_ID_V3) }
             nm.createNotificationChannel(
                 NotificationChannel(CHANNEL_ID, "Music playback", NotificationManager.IMPORTANCE_DEFAULT).apply {
-                    description = "Native LastWave playback controls"
+                    description = "Native Aura playback controls"
                     setShowBadge(false)
                     setSound(null, null)
                     enableVibration(false)
@@ -1628,7 +1629,8 @@ class MusicPlaybackService : MediaBrowserServiceCompat() {
         const val CONTENT_STYLE_LIST = 1
         const val MAX_CAR_QUEUE_ITEMS = 100
         const val MAX_CAR_QUEUE_BEFORE_CURRENT = 50
-        const val CHANNEL_ID = "lastwave_playback_v3"
+        const val CHANNEL_ID = "aura_playback_v1"
+        const val LEGACY_CHANNEL_ID_V3 = "lastwave_playback_v3"
         const val LEGACY_CHANNEL_ID = "lastwave_playback_v2"
         const val LEGACY_CHANNEL_ID_V1 = "lastwave_playback"
         const val NOTIFICATION_ID = 4102
