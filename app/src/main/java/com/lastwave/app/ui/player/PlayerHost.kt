@@ -152,6 +152,8 @@ import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.SmartDisplay
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.automirrored.filled.ArrowForwardIos
 import androidx.compose.material.icons.outlined.FavoriteBorder
 import androidx.compose.material3.AlertDialog
@@ -2317,6 +2319,7 @@ private fun FullPlayer(
     var showSignalPath by remember { mutableStateOf(false) }
     var showAudioControls by remember { mutableStateOf(false) }
     var showAutoEq by remember { mutableStateOf(false) }
+    var showVocalSeparator by remember { mutableStateOf(false) }
     val signalPath by player.signalPath.collectAsStateWithLifecycle()
     val usbDac by player.usbDacState.collectAsStateWithLifecycle()
     var isArtworkDragging by remember(track.videoId, track.title) { mutableStateOf(false) }
@@ -2878,6 +2881,31 @@ private fun FullPlayer(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                             ) {
+                                if (currentTab == FullPlayerTab.LYRICS) {
+                                    val vocalVc = player.vocalSeparatorController
+                                    val isVocalOn by vocalVc.isEnabled.collectAsStateWithLifecycle()
+                                    val vocalLevel by vocalVc.vocalVolume.collectAsStateWithLifecycle()
+                                    val isKaraoke = isVocalOn && vocalLevel < 0.95f
+                                    LiquidGlassSurface(
+                                        onClick = { showVocalSeparator = true },
+                                        shape = CircleShape,
+                                        color = if (isKaraoke) MaterialTheme.colorScheme.primary.copy(alpha = 0.35f)
+                                        else liquidGlassContainerColor(Color.White.copy(alpha = 0.14f)),
+                                        contentColor = if (isKaraoke) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.94f),
+                                        glassModifier = Modifier.liquidGlassChrome(
+                                            CircleShape,
+                                            LocalLiquidGlass.current,
+                                            LiquidGlassPreset.FloatingControls,
+                                        ),
+                                        modifier = Modifier.size(44.dp),
+                                    ) {
+                                        Icon(
+                                            if (isKaraoke) Icons.Filled.MicOff else Icons.Filled.Mic,
+                                            contentDescription = "Vocal & Music Separator",
+                                            modifier = Modifier.size(22.dp),
+                                        )
+                                    }
+                                }
                                 if (currentTab == FullPlayerTab.LYRICS && onSetLyricsOffsetMs != null) {
                                     LiquidGlassSurface(
                                         onClick = { showLyricsOffsetDialog = true },
@@ -3521,6 +3549,41 @@ private fun FullPlayer(
                                                     )
                                                 }
                                             }
+                                            val vocalVc = player.vocalSeparatorController
+                                            val isVocalOn by vocalVc.isEnabled.collectAsStateWithLifecycle()
+                                            val vocalLevel by vocalVc.vocalVolume.collectAsStateWithLifecycle()
+                                            val isKaraokeActive = isVocalOn && vocalLevel < 0.95f
+                                            val vocalInteraction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+                                            val isVocalPressed by vocalInteraction.collectIsPressedAsState()
+                                            val vocalScale by animateFloatAsState(
+                                                targetValue = if (isVocalPressed) 0.82f else 1.0f,
+                                                animationSpec = ExpressiveMotion.spatialSpring(),
+                                                label = "vocalScale",
+                                            )
+                                            LiquidGlassSurface(
+                                                glassModifier = Modifier.liquidGlassChrome(CircleShape, LocalLiquidGlass.current, LiquidGlassPreset.PlayerControls, interactionSource = vocalInteraction),
+                                                onClick = { showVocalSeparator = true },
+                                                interactionSource = vocalInteraction,
+                                                shape = CircleShape,
+                                                color = if (isKaraokeActive) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.90f) else liquidGlassContainerColor(Color.White.copy(alpha = 0.14f)),
+                                                contentColor = if (isKaraokeActive) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.90f),
+                                                tonalElevation = 0.dp,
+                                                shadowElevation = 0.dp,
+                                                modifier = Modifier
+                                                    .size(46.dp)
+                                                    .graphicsLayer {
+                                                        scaleX = vocalScale
+                                                        scaleY = vocalScale
+                                                    },
+                                            ) {
+                                                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                                    Icon(
+                                                        if (isKaraokeActive) Icons.Filled.MicOff else Icons.Filled.Mic,
+                                                        contentDescription = "Vocal & Music Separator",
+                                                        modifier = Modifier.size(24.dp),
+                                                    )
+                                                }
+                                            }
                                         }
                                     }
                                     Spacer(Modifier.height(10.dp))
@@ -3648,6 +3711,12 @@ private fun FullPlayer(
     }
     if (showAutoEq) {
         com.lastwave.app.ui.settings.autoeq.AutoEqDialog(onDismiss = { showAutoEq = false })
+    }
+    if (showVocalSeparator) {
+        VocalSeparatorSheet(
+            vocalController = player.vocalSeparatorController,
+            onDismiss = { showVocalSeparator = false },
+        )
     }
 }
 }

@@ -119,6 +119,8 @@ class NativeProcessingAudioSink(
     private val directEq = com.lastwave.app.playback.eq.DirectPcmEq()
     /** Buffer already equalised: Media3 retries the same object until consumed. */
     private var directEqBuffer: ByteBuffer? = null
+    var vocalSeparatorController: com.lastwave.app.playback.vocal.VocalSeparatorController? = null
+    private var vocalBuffer: ByteBuffer? = null
 
     var onConfiguredFormat: ((sampleRateHz: Int, pcmEncoding: Int, channelCount: Int) -> Unit)? = null
     var bitDepthHintProvider: (() -> Int?)? = null
@@ -187,6 +189,8 @@ class NativeProcessingAudioSink(
             onConfiguredFormat?.invoke(format.sampleRate, format.pcmEncoding, format.channelCount)
         }
         directEqBuffer = null
+        vocalBuffer = null
+        vocalSeparatorController?.dsp?.reset()
         if (format.sampleMimeType == MimeTypes.AUDIO_RAW && format.sampleRate > 0) {
             directEq.configure(format.sampleRate, format.channelCount, format.pcmEncoding)
         }
@@ -474,6 +478,20 @@ class NativeProcessingAudioSink(
     ): Boolean {
         maybeAdoptExclusiveUsb()
         maybeAdoptInternalDirect()
+        vocalSeparatorController?.let { vc ->
+            if (vocalBuffer !== buffer && vc.isEnabled.value) {
+                val fmt = configuredFormat
+                vc.dsp.processPcm(
+                    buffer = buffer,
+                    sampleRate = fmt?.sampleRate ?: 44100,
+                    channels = fmt?.channelCount ?: 2,
+                    pcmEncoding = fmt?.pcmEncoding ?: C.ENCODING_PCM_16BIT,
+                    vocalGain = vc.vocalVolume.value,
+                    musicGain = vc.musicVolume.value,
+                )
+                vocalBuffer = buffer
+            }
+        }
         if (directEqBuffer !== buffer && isDirectEqRoute()) {
             directEq.process(buffer)
             directEqBuffer = buffer
@@ -481,7 +499,12 @@ class NativeProcessingAudioSink(
         val consumed = handleRoutedBuffer(buffer, presentationTimeUs, encodedAccessUnitCount)
         // Decoder buffers are recycled objects: once consumed, the next
         // payload in the same object must be equalised again.
-        if (consumed) directEqBuffer = null
+        if (consumed) {
+            directEqBuffer = null
+        vocalBuffer = null
+        vocalSeparatorController?.dsp?.reset()
+            vocalBuffer = null
+        }
         return consumed
     }
 
@@ -1476,6 +1499,8 @@ class NativeProcessingAudioSink(
     override fun flush() {
         directEq.reset()
         directEqBuffer = null
+        vocalBuffer = null
+        vocalSeparatorController?.dsp?.reset()
         clearPending()
         clearEndOfStream()
         exclusiveEnded = false
@@ -1516,6 +1541,8 @@ class NativeProcessingAudioSink(
     override fun reset() {
         directEq.reset()
         directEqBuffer = null
+        vocalBuffer = null
+        vocalSeparatorController?.dsp?.reset()
         usbOutput?.setFormat(null)
         if (usbExclusive && exclusiveWanted) {
             exclusiveUsb?.prepareForNextItem()

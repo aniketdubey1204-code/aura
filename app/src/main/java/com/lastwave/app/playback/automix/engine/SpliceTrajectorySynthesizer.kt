@@ -94,10 +94,13 @@ object SpliceTrajectorySynthesizer {
             .coerceIn(8_000L, 30_000L)
 
         // Ensure duration never exceeds 40% of the total track length
-        plannedDurationMs = minOf(plannedDurationMs, (outDur * 0.40f).toLong()).coerceAtLeast(4_000L)
+        plannedDurationMs = minOf(plannedDurationMs, (outDur * 0.40f).toLong()).coerceIn(4_000L, 30_000L)
 
         // 6. Anchor Cue-Out and Cue-In to Beat Grids
         var cueOutStartMs = maxOf(0L, outDur - plannedDurationMs)
+        if (outDur > 40_000L) {
+            cueOutStartMs = cueOutStartMs.coerceAtLeast(outDur - 40_000L)
+        }
         var cueInStartMs = 0L
 
         if (incomingSignature != null) {
@@ -125,8 +128,11 @@ object SpliceTrajectorySynthesizer {
                     loopBars = 8
                 } else {
                     // Shorten duration to exit cleanly before vocal clash
-                    plannedDurationMs = (plannedDurationMs * 0.65f).toLong().coerceAtLeast(8_000L)
+                    plannedDurationMs = (plannedDurationMs * 0.65f).toLong().coerceIn(4_000L, 30_000L)
                     cueOutStartMs = maxOf(0L, outDur - plannedDurationMs)
+                    if (outDur > 40_000L) {
+                        cueOutStartMs = cueOutStartMs.coerceAtLeast(outDur - 40_000L)
+                    }
                 }
             }
         }

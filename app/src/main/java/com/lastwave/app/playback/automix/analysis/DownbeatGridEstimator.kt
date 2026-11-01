@@ -51,7 +51,7 @@ object DownbeatGridEstimator {
 
         // Structural phrase detection (intro drop typically 16 or 32 bars in, outro breakdown in final 20-40s)
         val introDropMs = minOf(firstDownbeatMs + (barIntervalMs * 4L), durationMs / 4L)
-        val outroBreakdownMs = maxOf(durationMs - (barIntervalMs * 8L), durationMs / 2L)
+        val outroBreakdownMs = maxOf(durationMs - (barIntervalMs * 8L), durationMs - 40_000L).coerceAtLeast(0L)
         val silenceTailMs = detectSilenceTail(pcm, sampleRate, durationMs)
 
         return BeatGridEstimate(
