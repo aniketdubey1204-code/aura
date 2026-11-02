@@ -270,7 +270,6 @@ class MusicPlayer @Inject constructor(
     private val jamRepository: dagger.Lazy<com.lastwave.app.data.jam.JamRepository>,
     private val autoMixCoordinator: dagger.Lazy<com.lastwave.app.playback.automix.engine.DualDeckTransportCoordinator>,
     private val smartRadioRecommender: dagger.Lazy<com.lastwave.app.playback.SmartRadioRecommender>,
-    val vocalSeparatorController: com.lastwave.app.playback.vocal.VocalSeparatorController,
 ) {
 
     private val appContext = context.applicationContext
@@ -1462,7 +1461,6 @@ class MusicPlayer @Inject constructor(
                     // Same rule as USB: the crossfade standby never claims the endpoint.
                     internalDirect = if (handleAudioFocus) internalDirectOutput else null,
                 ).also { createdSink ->
-                    createdSink.vocalSeparatorController = vocalSeparatorController
                     createdSink.onConfiguredFormat = { rateHz, _, _ ->
                         // The crossfade standby arms early and configures its
                         // sink while the OUTGOING track is still the live one.
