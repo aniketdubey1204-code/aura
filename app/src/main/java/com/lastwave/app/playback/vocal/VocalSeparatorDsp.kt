@@ -4,63 +4,72 @@ import androidx.media3.common.C
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
- * Real-time zero-latency stereo vocal/music separator using full-spectrum
- * mid/side decomposition with bass-protected crossover.
+ * Real-time, zero-latency stereo vocal and music separator with transient beat preservation
+ * and 3-band spectral azimuth isolation.
  *
- * Approach:
- *   1. Decode stereo into Mid (center-panned) and Side (stereo-panned) signals.
- *   2. Split Mid through a 120 Hz bass crossover (2nd-order Butterworth LPF).
- *      MidBass  = LPF(Mid)        — kick, sub-bass, bass guitar fundamentals
- *      MidUpper = Mid − MidBass   — vocals, snare, center instruments
- *   3. Reconstruct with independent gain control:
- *      OutputMid  = MidBass + vocalGain × MidUpper
- *      OutputSide = musicGain × Side
- *      L_out = OutputMid + OutputSide
- *      R_out = OutputMid − OutputSide
+ * Solves the two fundamental flaws of basic mid/side processing:
+ * 1. Beat Loss in Karaoke: Uses a fast differential envelope tracker (transient detector)
+ *    on the center channel. Percussive onsets (snare crack, kick click, claps, drum hits)
+ *    are recognized as rhythmic transients and preserved in the music path, while sustained
+ *    vocal formants are isolated for attenuation. Sub-bass (< 140 Hz) and cymbal air (> 7.5 kHz)
+ *    are routed cleanly into the music path.
+ * 2. Incomplete Vocal Solo: Rather than playing the full mono mix, vocal solo mode strips
+ *    the sub-bass, silences percussive drum transients, and applies azimuth side-correlation
+ *    to suppress stereo-spread instruments.
  *
- * Bass below 120 Hz always passes through at unity regardless of slider
- * position, so the bottom end never disappears. The complementary filter
- * pair (LPF + subtraction) sums flat at all frequencies — at unity gains
- * the output is bit-identical to the input.
- *
- * Exponential gain smoothing (~10 ms time constant) eliminates zipper noise
- * when moving sliders. Filter states persist across buffer boundaries and
- * are only reset on track changes or seeks.
+ * Mathematical guarantee: When both gains are unity (or bypassed), the reconstruction
+ * is bit-for-bit identical to the original stereo input.
  */
 class VocalSeparatorDsp {
 
-    // ── 2nd-order Butterworth LPF coefficients (bass crossover at 120 Hz) ──
-    private var lpB0 = 0f
-    private var lpB1 = 0f
-    private var lpB2 = 0f
-    private var lpA1 = 0f
-    private var lpA2 = 0f
+    // ── Crossover Filters ──
+    // 2nd-order Butterworth LPF at 140 Hz (Bass: kick body, sub-bass)
+    private var bassB0 = 0f
+    private var bassB1 = 0f
+    private var bassB2 = 0f
+    private var bassA1 = 0f
+    private var bassA2 = 0f
 
-    // Filter delay-line states for the bass crossover on the Mid channel.
-    // Only the Mid needs filtering; Side passes through unfiltered.
-    private var lpX1 = 0f
-    private var lpX2 = 0f
-    private var lpY1 = 0f
-    private var lpY2 = 0f
+    private var bassX1 = 0f
+    private var bassX2 = 0f
+    private var bassY1 = 0f
+    private var bassY2 = 0f
 
-    // Exponential gain smoothing to prevent zipper noise on slider moves
+    // 2nd-order Butterworth HPF at 7500 Hz (Air: cymbal sheen, hi-hats, ambiance)
+    private var airB0 = 0f
+    private var airB1 = 0f
+    private var airB2 = 0f
+    private var airA1 = 0f
+    private var airA2 = 0f
+
+    private var airX1 = 0f
+    private var airX2 = 0f
+    private var airY1 = 0f
+    private var airY2 = 0f
+
+    // ── Transient Beat Detector States ──
+    private var envFast = 0f
+    private var envSlow = 0f
+
+    private var coeffFastAttack = 0.02f
+    private var coeffFastDecay = 0.0015f
+    private var coeffSlowAttack = 0.001f
+    private var coeffSlowDecay = 0.00025f
+
+    // ── Gain Smoothing ──
     private var smoothedVocalGain = 1f
     private var smoothedMusicGain = 1f
-    private var smoothingCoeff = 0.001f  // recalculated in configure()
+    private var smoothingCoeff = 0.002f
 
     private var configuredSampleRate = 0
 
-    /**
-     * Compute LPF coefficients for the bass-protection crossover and the
-     * gain-smoothing time constant. Called automatically when the sample
-     * rate changes; safe to call repeatedly for the same rate.
-     */
     fun configure(sampleRateHz: Int) {
         val sr = sampleRateHz.coerceIn(8000, 384000)
         if (sr == configuredSampleRate) return
@@ -69,20 +78,42 @@ class VocalSeparatorDsp {
         val fs = sr.toDouble()
         val q = 1.0 / sqrt(2.0) // Butterworth Q ≈ 0.7071
 
-        // 2nd-order Butterworth low-pass at 120 Hz
-        val fc = 120.0.coerceAtMost(fs * 0.45)
-        val w0 = 2.0 * PI * fc / fs
-        val cosW = cos(w0)
-        val alpha = sin(w0) / (2.0 * q)
-        val a0 = 1.0 + alpha
+        // 1. Low-Pass at 140 Hz (protects kick fundamental & bass guitar)
+        val fcBass = 140.0.coerceAtMost(fs * 0.45)
+        val w0Bass = 2.0 * PI * fcBass / fs
+        val cosBass = cos(w0Bass)
+        val alphaBass = sin(w0Bass) / (2.0 * q)
+        val a0Bass = 1.0 + alphaBass
 
-        lpB0 = ((1.0 - cosW) / (2.0 * a0)).toFloat()
-        lpB1 = ((1.0 - cosW) / a0).toFloat()
-        lpB2 = ((1.0 - cosW) / (2.0 * a0)).toFloat()
-        lpA1 = ((-2.0 * cosW) / a0).toFloat()
-        lpA2 = ((1.0 - alpha) / a0).toFloat()
+        bassB0 = ((1.0 - cosBass) / (2.0 * a0Bass)).toFloat()
+        bassB1 = ((1.0 - cosBass) / a0Bass).toFloat()
+        bassB2 = ((1.0 - cosBass) / (2.0 * a0Bass)).toFloat()
+        bassA1 = ((-2.0 * cosBass) / a0Bass).toFloat()
+        bassA2 = ((1.0 - alphaBass) / a0Bass).toFloat()
 
-        // Gain smoothing: ~10 ms exponential time constant
+        // 2. High-Pass at 7500 Hz (protects cymbals, hi-hats, room air)
+        val fcAir = 7500.0.coerceAtMost(fs * 0.45)
+        val w0Air = 2.0 * PI * fcAir / fs
+        val cosAir = cos(w0Air)
+        val alphaAir = sin(w0Air) / (2.0 * q)
+        val a0Air = 1.0 + alphaAir
+
+        airB0 = ((1.0 + cosAir) / (2.0 * a0Air)).toFloat()
+        airB1 = (-(1.0 + cosAir) / a0Air).toFloat()
+        airB2 = ((1.0 + cosAir) / (2.0 * a0Air)).toFloat()
+        airA1 = ((-2.0 * cosAir) / a0Air).toFloat()
+        airA2 = ((1.0 - alphaAir) / a0Air).toFloat()
+
+        // 3. Transient detector time constants
+        // Fast attack ~1.2 ms, fast decay ~18 ms
+        coeffFastAttack = (1.0 - exp(-1.0 / (0.0012 * fs))).toFloat()
+        coeffFastDecay = (1.0 - exp(-1.0 / (0.018 * fs))).toFloat()
+
+        // Slow attack ~30 ms, slow decay ~120 ms
+        coeffSlowAttack = (1.0 - exp(-1.0 / (0.030 * fs))).toFloat()
+        coeffSlowDecay = (1.0 - exp(-1.0 / (0.120 * fs))).toFloat()
+
+        // Gain smoothing ~10 ms
         smoothingCoeff = (1.0 - exp(-1.0 / (0.010 * fs))).toFloat()
 
         resetStates()
@@ -93,27 +124,31 @@ class VocalSeparatorDsp {
     }
 
     private fun resetStates() {
-        lpX1 = 0f; lpX2 = 0f
-        lpY1 = 0f; lpY2 = 0f
+        bassX1 = 0f; bassX2 = 0f; bassY1 = 0f; bassY2 = 0f
+        airX1 = 0f; airX2 = 0f; airY1 = 0f; airY2 = 0f
+        envFast = 0f
+        envSlow = 0f
         smoothedVocalGain = 1f
         smoothedMusicGain = 1f
     }
 
-    /**
-     * Run the bass-protection LPF on one sample of the Mid channel.
-     * Returns the low-frequency component (below ~120 Hz).
-     */
-    private fun lowpassMid(input: Float): Float {
-        val y = lpB0 * input + lpB1 * lpX1 + lpB2 * lpX2 -
-                lpA1 * lpY1 - lpA2 * lpY2
-        lpX2 = lpX1; lpX1 = input
-        lpY2 = lpY1; lpY1 = y
+    private fun filterBass(input: Float): Float {
+        val y = bassB0 * input + bassB1 * bassX1 + bassB2 * bassX2 - bassA1 * bassY1 - bassA2 * bassY2
+        bassX2 = bassX1; bassX1 = input
+        bassY2 = bassY1; bassY1 = y
+        return y
+    }
+
+    private fun filterAir(input: Float): Float {
+        val y = airB0 * input + airB1 * airX1 + airB2 * airX2 - airA1 * airY1 - airA2 * airY2
+        airX2 = airX1; airX1 = input
+        airY2 = airY1; airY1 = y
         return y
     }
 
     /**
-     * Process one stereo sample pair and return the result packed as a Long:
-     * upper 32 bits = outL (Float.toBits), lower 32 bits = outR (Float.toBits).
+     * Processes one stereo sample pair.
+     * Preserves drum transients, protects low bass and cymbal air, and isolates center vocals.
      */
     private fun processStereoSample(
         l: Float,
@@ -121,36 +156,60 @@ class VocalSeparatorDsp {
         targetVocalGain: Float,
         targetMusicGain: Float,
     ): Long {
-        // Exponential gain smoothing (prevents clicks/zipper noise on slider moves)
+        // Gain smoothing
         smoothedVocalGain += smoothingCoeff * (targetVocalGain - smoothedVocalGain)
         smoothedMusicGain += smoothingCoeff * (targetMusicGain - smoothedMusicGain)
+        val vG = smoothedVocalGain
+        val mG = smoothedMusicGain
 
         // Mid/Side stereo decomposition
-        val mid = 0.5f * (l + r)    // center-panned content: vocals, bass, kick, snare
-        val side = 0.5f * (l - r)   // stereo-panned content: guitars, keys, pads, effects
+        val mid = 0.5f * (l + r)
+        val side = 0.5f * (l - r)
 
-        // Bass crossover on mid: protect sub-bass and kick fundamentals
-        val midBass = lowpassMid(mid)       // below ~120 Hz (always passes through)
-        val midUpper = mid - midBass        // above ~120 Hz (vocal-heavy, gain-controlled)
+        // 3-band spectral decomposition of the center channel
+        val midBass = filterBass(mid)  // < 140 Hz (kick drum body, sub-bass)
+        val midAir = filterAir(mid)    // > 7500 Hz (cymbals, hi-hat shimmer)
+        val midBand = mid - midBass - midAir // 140 Hz – 7500 Hz (vocal range + snare/beats)
 
-        // Apply independent gains
-        // Bass always at unity. Upper center controlled by vocal slider.
-        // Side signal controlled by music slider.
-        val outMid = midBass + smoothedVocalGain * midUpper
-        val outSide = smoothedMusicGain * side
+        val absMidBand = abs(midBand)
 
-        // Reconstruct stereo
+        // Transient beat detection on the mid band
+        if (absMidBand > envFast) {
+            envFast += coeffFastAttack * (absMidBand - envFast)
+        } else {
+            envFast += coeffFastDecay * (absMidBand - envFast)
+        }
+
+        if (absMidBand > envSlow) {
+            envSlow += coeffSlowAttack * (absMidBand - envSlow)
+        } else {
+            envSlow += coeffSlowDecay * (absMidBand - envSlow)
+        }
+
+        val diff = (envFast - envSlow).coerceAtLeast(0f)
+        val transientWeight = (diff / (envSlow + 0.008f) * 2.2f).coerceIn(0f, 1f)
+
+        // Azimuth side-correlation: wide instruments have strong side energy
+        val absSide = abs(side)
+        val centerPurity = (1f - (absSide * 1.5f / (absMidBand + 0.001f))).coerceIn(0f, 1f)
+
+        // Vocal component: sustained center energy with low transient energy
+        val vocalWeight = (1.0f - transientWeight) * centerPurity
+        val midVocal = vocalWeight * midBand
+        val midMusicBand = midBand - midVocal
+
+        // Reconstruct Mid and Side
+        // Music path retains bass, air, drum transients, and side instruments.
+        // Vocal path receives isolated center formants.
+        val outMid = mG * (midBass + midAir + midMusicBand) + vG * midVocal
+        val outSide = mG * side
+
         val outL = (outMid + outSide).coerceIn(-1.0f, 1.0f)
         val outR = (outMid - outSide).coerceIn(-1.0f, 1.0f)
 
         return (outL.toBits().toLong() shl 32) or (outR.toBits().toLong() and 0xFFFFFFFFL)
     }
 
-    /**
-     * Processes a stereo PCM ByteBuffer in place. Requires at least 2 channels.
-     * Filter states persist across calls — do NOT call [reset] between
-     * consecutive buffers of the same track.
-     */
     fun processPcm(
         buffer: ByteBuffer,
         sampleRate: Int,
@@ -162,10 +221,8 @@ class VocalSeparatorDsp {
         if (channels < 2) return
         if (!buffer.hasRemaining()) return
 
-        // Bypass: both gains at unity means output equals input
-        if (kotlin.math.abs(vocalGain - 1.0f) < 0.005f &&
-            kotlin.math.abs(musicGain - 1.0f) < 0.005f
-        ) {
+        // Bypass: both gains at unity within epsilon
+        if (abs(vocalGain - 1.0f) < 0.005f && abs(musicGain - 1.0f) < 0.005f) {
             return
         }
 
@@ -190,8 +247,6 @@ class VocalSeparatorDsp {
             buffer.order(originalOrder)
         }
     }
-
-    // ── Format-specific in-place processors ──
 
     private fun processFloatInPlace(buffer: ByteBuffer, vGain: Float, mGain: Float) {
         var pos = buffer.position()
