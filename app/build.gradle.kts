@@ -104,8 +104,8 @@ android {
         create("release_config") {
             val base64Key = resolveSecret("SIGNING_KEY")
             val storeFilePath = resolveSecret("RELEASE_STORE_FILE")
-            val storePasswordProp = resolveSecret("RELEASE_STORE_PASSWORD", "KEY_STORE_PASSWORD")
-            val keyAliasProp = resolveSecret("RELEASE_KEY_ALIAS", "ALIAS").ifBlank { "release_key" }
+            val storePasswordProp = resolveSecret("RELEASE_STORE_PASSWORD", "KEY_STORE_PASSWORD").ifBlank { "androidaura" }
+            val keyAliasProp = resolveSecret("RELEASE_KEY_ALIAS", "ALIAS").ifBlank { "aura_release" }
             val keyPasswordProp = resolveSecret("RELEASE_KEY_PASSWORD", "KEY_PASSWORD").ifBlank { storePasswordProp }
 
             val keystoreFile: File? = when {
@@ -120,43 +120,46 @@ android {
                         null
                     }
                 }
-                storeFilePath.isNotBlank() -> file(storeFilePath)
-                else -> null
-            }
-
-            val effectiveKeystore: File? = if (keystoreFile != null && keystoreFile.exists() && storePasswordProp.isNotBlank()) {
-                keystoreFile
-            } else {
-                val autoKeystore = layout.buildDirectory.file("signing/aura_auto_release.keystore").get().asFile
-                if (!autoKeystore.exists()) {
-                    autoKeystore.parentFile.mkdirs()
-                    val keytoolCmd = listOf(
-                        "keytool", "-genkeypair", "-v",
-                        "-keystore", autoKeystore.absolutePath,
-                        "-alias", "aura_release",
-                        "-keyalg", "RSA", "-keysize", "2048",
-                        "-validity", "10000",
-                        "-storepass", "androidaura",
-                        "-keypass", "androidaura",
-                        "-dname", "CN=Aura, O=Aura, C=US"
-                    )
-                    runCatching {
-                        ProcessBuilder(keytoolCmd).redirectErrorStream(true).start().waitFor()
+                storeFilePath.isNotBlank() -> {
+                    val direct = File(storeFilePath)
+                    val projectRel = file(storeFilePath)
+                    val rootRel = rootProject.file(storeFilePath)
+                    when {
+                        direct.isAbsolute && direct.exists() -> direct
+                        projectRel.exists() -> projectRel
+                        rootRel.exists() -> rootRel
+                        else -> null
                     }
                 }
-                if (autoKeystore.exists()) autoKeystore else null
+                else -> {
+                    val directApp = rootProject.file("app/keystores/aura_release.jks")
+                    val subApp = file("keystores/aura_release.jks")
+                    when {
+                        directApp.exists() -> directApp
+                        subApp.exists() -> subApp
+                        else -> null
+                    }
+                }
+            } ?: run {
+                val directApp = rootProject.file("app/keystores/aura_release.jks")
+                val subApp = file("keystores/aura_release.jks")
+                when {
+                    directApp.exists() -> directApp
+                    subApp.exists() -> subApp
+                    else -> null
+                }
             }
 
-            if (effectiveKeystore != null && effectiveKeystore.exists()) {
-                storeFile = effectiveKeystore
-                storePassword = if (keystoreFile != null && storePasswordProp.isNotBlank()) storePasswordProp else "androidaura"
-                keyAlias = if (keystoreFile != null && keyAliasProp.isNotBlank()) keyAliasProp else "aura_release"
-                keyPassword = if (keystoreFile != null && keyPasswordProp.isNotBlank()) keyPasswordProp else "androidaura"
+            if (keystoreFile != null && keystoreFile.exists()) {
+                storeFile = keystoreFile
+                storePassword = storePasswordProp
+                keyAlias = keyAliasProp
+                keyPassword = keyPasswordProp
                 enableV1Signing = true
                 enableV2Signing = true
                 enableV3Signing = true
             } else {
-                initWith(getByName("debug"))
+                throw GradleException("Permanent release keystore not found! Checked: $keystoreFile and app/keystores/aura_release.jks")
             }
         }
     }

@@ -58,18 +58,14 @@ jobs:
         run: |
           if [ -f "app/keystores/aura_release.jks" ]; then
             echo "Using committed permanent release keystore..."
-            echo "RELEASE_STORE_FILE=app/keystores/aura_release.jks" >> $GITHUB_ENV
+            echo "RELEASE_STORE_FILE=$GITHUB_WORKSPACE/app/keystores/aura_release.jks" >> $GITHUB_ENV
             echo "RELEASE_STORE_PASSWORD=androidaura" >> $GITHUB_ENV
             echo "RELEASE_KEY_ALIAS=aura_release" >> $GITHUB_ENV
             echo "RELEASE_KEY_PASSWORD=androidaura" >> $GITHUB_ENV
-          elif [ -z "$SIGNING_KEY" ] && [ -z "$RELEASE_STORE_FILE" ]; then
-            echo "Auto-generating release keystore for packaging..."
-            mkdir -p /tmp/keystore
-            keytool -genkeypair -v -keystore /tmp/keystore/release.keystore -alias aura_release -keyalg RSA -keysize 2048 -validity 10000 -storepass androidaura -keypass androidaura -dname "CN=Aura, O=Aura, C=US"
-            echo "RELEASE_STORE_FILE=/tmp/keystore/release.keystore" >> $GITHUB_ENV
-            echo "RELEASE_STORE_PASSWORD=androidaura" >> $GITHUB_ENV
-            echo "RELEASE_KEY_ALIAS=aura_release" >> $GITHUB_ENV
-            echo "RELEASE_KEY_PASSWORD=androidaura" >> $GITHUB_ENV
+            echo "EXPECTED_CERT_SHA256=4d32544d6c9a266539aaf882adc1838d38daf0142e11aa38fe11d966e41e2749" >> $GITHUB_ENV
+          else
+            echo "::error::Permanent release keystore app/keystores/aura_release.jks missing!"
+            exit 1
           fi
 
       - name: Build Android 10 Release APKs
@@ -136,7 +132,7 @@ jobs:
 
       - name: Verify APK signatures + publish checksums
         env:
-          EXPECTED_CERT_SHA256: ${{ secrets.EXPECTED_CERT_SHA256 }}
+          EXPECTED_CERT_SHA256: ${{ env.EXPECTED_CERT_SHA256 || secrets.EXPECTED_CERT_SHA256 || '4d32544d6c9a266539aaf882adc1838d38daf0142e11aa38fe11d966e41e2749' }}
         run: |
           SDKROOT="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
           APKSIGNER=$(find "$SDKROOT/build-tools" -maxdepth 2 -name apksigner 2>/dev/null | head -n1)
