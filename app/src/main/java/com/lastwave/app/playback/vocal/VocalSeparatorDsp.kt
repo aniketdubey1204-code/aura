@@ -3,50 +3,76 @@ package com.lastwave.app.playback.vocal
 import androidx.media3.common.C
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.sqrt
+import kotlin.math.tan
 
 /**
  * Real-time, zero-latency in-place PCM DSP for vocal and instrumental music separation.
  *
- * Uses phantom center isolation combined with dual-stage Linkwitz-Riley biquad filters:
- * 1. Mid/Side stereo decomposition: M = 0.5 * (L + R), S = 0.5 * (L - R)
- * 2. Vocal bandpass isolation on M (200 Hz HPF -> 4500 Hz LPF)
- * 3. Spectral subtraction: M_music = M - M_vocal
- * 4. Spatial reconstruction: L_music = M_music + S, R_music = M_music - S
- * 5. Dynamic dual-line gain:
- *      L_out = musicGain * L_music + vocalGain * L_vocal
- *      R_out = musicGain * R_music + vocalGain * R_vocal
+ * Technique: 4th-order Linkwitz-Riley (cascaded dual-biquad) mid/side decomposition.
  *
- * Runs entirely in-place with zero memory allocation inside the audio thread.
+ * 1. Mid/Side stereo split: M = 0.5 * (L + R), S = 0.5 * (L - R)
+ * 2. Vocal band isolation on M using cascaded 4th-order Linkwitz-Riley bandpass
+ *    (200 Hz HPF → 4500 Hz LPF, each stage is two cascaded Butterworth biquads
+ *    giving −24 dB/oct slopes)
+ * 3. Complementary extraction: M_music = M − M_vocal_band
+ * 4. Independent gain mixing with cross-feed compensation:
+ *      L_out = vocalGain * (M_vocal + S_vocal) + musicGain * (M_music + S_music)
+ *      R_out = vocalGain * (M_vocal − S_vocal) + musicGain * (M_music − S_music)
+ *    where S_vocal is the side signal filtered through the same vocal bandpass,
+ *    and S_music = S − S_vocal.
+ * 5. Gain-dependent smoothing to eliminate zipper noise on slider moves.
+ *
+ * Filter states are persistent across buffer boundaries — never reset mid-stream.
+ * Calling [reset] is only appropriate on track changes or seek discontinuities.
  */
 class VocalSeparatorDsp {
 
-    // Filter coefficients: High-Pass (200 Hz)
-    private var hpB0 = 1f
-    private var hpB1 = -2f
-    private var hpB2 = 1f
-    private var hpA1 = 0f
-    private var hpA2 = 0f
+    // ── Two cascaded biquad stages per filter (4th-order Linkwitz-Riley) ──
 
-    // Filter coefficients: Low-Pass (4500 Hz)
-    private var lpB0 = 1f
-    private var lpB1 = 2f
-    private var lpB2 = 1f
-    private var lpA1 = 0f
-    private var lpA2 = 0f
+    // High-Pass 200 Hz – Stage 1 (Mid channel)
+    private var hp1MidB0 = 1f; private var hp1MidB1 = -2f; private var hp1MidB2 = 1f
+    private var hp1MidA1 = 0f; private var hp1MidA2 = 0f
+    private var hp1MidX1 = 0f; private var hp1MidX2 = 0f
+    private var hp1MidY1 = 0f; private var hp1MidY2 = 0f
 
-    // Filter states
-    private var hpX1 = 0f
-    private var hpX2 = 0f
-    private var hpY1 = 0f
-    private var hpY2 = 0f
+    // High-Pass 200 Hz – Stage 2 (Mid channel)
+    private var hp2MidX1 = 0f; private var hp2MidX2 = 0f
+    private var hp2MidY1 = 0f; private var hp2MidY2 = 0f
 
-    private var lpX1 = 0f
-    private var lpX2 = 0f
-    private var lpY1 = 0f
-    private var lpY2 = 0f
+    // Low-Pass 4500 Hz – Stage 1 (Mid channel)
+    private var lp1MidB0 = 1f; private var lp1MidB1 = 2f; private var lp1MidB2 = 1f
+    private var lp1MidA1 = 0f; private var lp1MidA2 = 0f
+    private var lp1MidX1 = 0f; private var lp1MidX2 = 0f
+    private var lp1MidY1 = 0f; private var lp1MidY2 = 0f
+
+    // Low-Pass 4500 Hz – Stage 2 (Mid channel)
+    private var lp2MidX1 = 0f; private var lp2MidX2 = 0f
+    private var lp2MidY1 = 0f; private var lp2MidY2 = 0f
+
+    // High-Pass 200 Hz – Stage 1 (Side channel)
+    private var hp1SideX1 = 0f; private var hp1SideX2 = 0f
+    private var hp1SideY1 = 0f; private var hp1SideY2 = 0f
+
+    // High-Pass 200 Hz – Stage 2 (Side channel)
+    private var hp2SideX1 = 0f; private var hp2SideX2 = 0f
+    private var hp2SideY1 = 0f; private var hp2SideY2 = 0f
+
+    // Low-Pass 4500 Hz – Stage 1 (Side channel)
+    private var lp1SideX1 = 0f; private var lp1SideX2 = 0f
+    private var lp1SideY1 = 0f; private var lp1SideY2 = 0f
+
+    // Low-Pass 4500 Hz – Stage 2 (Side channel)
+    private var lp2SideX1 = 0f; private var lp2SideX2 = 0f
+    private var lp2SideY1 = 0f; private var lp2SideY2 = 0f
+
+    // Gain smoothing (exponential, ~5 ms time constant)
+    private var smoothedVocalGain = 1f
+    private var smoothedMusicGain = 1f
+    private var smoothingCoeff = 0.002f // updated in configure()
 
     private var configuredSampleRate = 0
 
@@ -56,71 +82,131 @@ class VocalSeparatorDsp {
         configuredSampleRate = sr
 
         val fs = sr.toDouble()
-        val q = 1.0 / sqrt(2.0) // 0.7071 Butterworth
+        val q = 1.0 / sqrt(2.0) // Butterworth Q = 0.7071
 
-        // 1. High-Pass at 200 Hz (cuts kick/bass guitar out of vocal detection)
+        // ── High-Pass at 200 Hz ──
         val hpFc = 200.0.coerceAtMost(fs * 0.45)
-        val w0Hp = 2.0 * Math.PI * hpFc / fs
+        val w0Hp = 2.0 * PI * hpFc / fs
         val cosHp = cos(w0Hp)
         val alphaHp = sin(w0Hp) / (2.0 * q)
         val a0Hp = 1.0 + alphaHp
 
-        hpB0 = ((1.0 + cosHp) / (2.0 * a0Hp)).toFloat()
-        hpB1 = (-(1.0 + cosHp) / a0Hp).toFloat()
-        hpB2 = ((1.0 + cosHp) / (2.0 * a0Hp)).toFloat()
-        hpA1 = ((-2.0 * cosHp) / a0Hp).toFloat()
-        hpA2 = ((1.0 - alphaHp) / a0Hp).toFloat()
+        hp1MidB0 = ((1.0 + cosHp) / (2.0 * a0Hp)).toFloat()
+        hp1MidB1 = (-(1.0 + cosHp) / a0Hp).toFloat()
+        hp1MidB2 = ((1.0 + cosHp) / (2.0 * a0Hp)).toFloat()
+        hp1MidA1 = ((-2.0 * cosHp) / a0Hp).toFloat()
+        hp1MidA2 = ((1.0 - alphaHp) / a0Hp).toFloat()
 
-        // 2. Low-Pass at 4500 Hz (cuts high cymbals/air out of vocal detection)
+        // ── Low-Pass at 4500 Hz ──
         val lpFc = 4500.0.coerceAtMost(fs * 0.45)
-        val w0Lp = 2.0 * Math.PI * lpFc / fs
+        val w0Lp = 2.0 * PI * lpFc / fs
         val cosLp = cos(w0Lp)
         val alphaLp = sin(w0Lp) / (2.0 * q)
         val a0Lp = 1.0 + alphaLp
 
-        lpB0 = ((1.0 - cosLp) / (2.0 * a0Lp)).toFloat()
-        lpB1 = ((1.0 - cosLp) / a0Lp).toFloat()
-        lpB2 = ((1.0 - cosLp) / (2.0 * a0Lp)).toFloat()
-        lpA1 = ((-2.0 * cosLp) / a0Lp).toFloat()
-        lpA2 = ((1.0 - alphaLp) / a0Lp).toFloat()
+        lp1MidB0 = ((1.0 - cosLp) / (2.0 * a0Lp)).toFloat()
+        lp1MidB1 = ((1.0 - cosLp) / a0Lp).toFloat()
+        lp1MidB2 = ((1.0 - cosLp) / (2.0 * a0Lp)).toFloat()
+        lp1MidA1 = ((-2.0 * cosLp) / a0Lp).toFloat()
+        lp1MidA2 = ((1.0 - alphaLp) / a0Lp).toFloat()
 
-        reset()
+        // Gain smoothing: ~5 ms time constant
+        smoothingCoeff = (1.0 - kotlin.math.exp(-1.0 / (0.005 * fs))).toFloat()
+
+        resetStates()
     }
 
     fun reset() {
-        hpX1 = 0f
-        hpX2 = 0f
-        hpY1 = 0f
-        hpY2 = 0f
-        lpX1 = 0f
-        lpX2 = 0f
-        lpY1 = 0f
-        lpY2 = 0f
+        resetStates()
     }
 
+    private fun resetStates() {
+        hp1MidX1 = 0f; hp1MidX2 = 0f; hp1MidY1 = 0f; hp1MidY2 = 0f
+        hp2MidX1 = 0f; hp2MidX2 = 0f; hp2MidY1 = 0f; hp2MidY2 = 0f
+        lp1MidX1 = 0f; lp1MidX2 = 0f; lp1MidY1 = 0f; lp1MidY2 = 0f
+        lp2MidX1 = 0f; lp2MidX2 = 0f; lp2MidY1 = 0f; lp2MidY2 = 0f
+
+        hp1SideX1 = 0f; hp1SideX2 = 0f; hp1SideY1 = 0f; hp1SideY2 = 0f
+        hp2SideX1 = 0f; hp2SideX2 = 0f; hp2SideY1 = 0f; hp2SideY2 = 0f
+        lp1SideX1 = 0f; lp1SideX2 = 0f; lp1SideY1 = 0f; lp1SideY2 = 0f
+        lp2SideX1 = 0f; lp2SideX2 = 0f; lp2SideY1 = 0f; lp2SideY2 = 0f
+
+        smoothedVocalGain = 1f
+        smoothedMusicGain = 1f
+    }
+
+    // ── Cascaded biquad: two identical second-order sections ──
+
     /**
-     * Filters one mono sample through the cascaded bandpass (HP -> LP).
+     * Filters the mid-channel sample through the cascaded HP→LP bandpass (4th order total).
+     * Returns the vocal-band component of the mid signal.
      */
-    private inline fun filterVocalBand(m: Float): Float {
-        // High-pass step
-        val hpOut = hpB0 * m + hpB1 * hpX1 + hpB2 * hpX2 - hpA1 * hpY1 - hpA2 * hpY2
-        hpX2 = hpX1
-        hpX1 = m
-        hpY2 = hpY1
-        hpY1 = hpOut
+    private fun filterMidVocalBand(input: Float): Float {
+        // HP stage 1
+        val hp1Out = hp1MidB0 * input + hp1MidB1 * hp1MidX1 + hp1MidB2 * hp1MidX2 -
+                hp1MidA1 * hp1MidY1 - hp1MidA2 * hp1MidY2
+        hp1MidX2 = hp1MidX1; hp1MidX1 = input
+        hp1MidY2 = hp1MidY1; hp1MidY1 = hp1Out
 
-        // Low-pass step
-        val lpOut = lpB0 * hpOut + lpB1 * lpX1 + lpB2 * lpX2 - lpA1 * lpY1 - lpA2 * lpY2
-        lpX2 = lpX1
-        lpX1 = hpOut
-        lpY2 = lpY1
-        lpY1 = lpOut
+        // HP stage 2 (same coefficients, independent state)
+        val hp2Out = hp1MidB0 * hp1Out + hp1MidB1 * hp2MidX1 + hp1MidB2 * hp2MidX2 -
+                hp1MidA1 * hp2MidY1 - hp1MidA2 * hp2MidY2
+        hp2MidX2 = hp2MidX1; hp2MidX1 = hp1Out
+        hp2MidY2 = hp2MidY1; hp2MidY1 = hp2Out
 
-        return lpOut
+        // LP stage 1
+        val lp1Out = lp1MidB0 * hp2Out + lp1MidB1 * lp1MidX1 + lp1MidB2 * lp1MidX2 -
+                lp1MidA1 * lp1MidY1 - lp1MidA2 * lp1MidY2
+        lp1MidX2 = lp1MidX1; lp1MidX1 = hp2Out
+        lp1MidY2 = lp1MidY1; lp1MidY1 = lp1Out
+
+        // LP stage 2 (same coefficients, independent state)
+        val lp2Out = lp1MidB0 * lp1Out + lp1MidB1 * lp2MidX1 + lp1MidB2 * lp2MidX2 -
+                lp1MidA1 * lp2MidY1 - lp1MidA2 * lp2MidY2
+        lp2MidX2 = lp2MidX1; lp2MidX1 = lp1Out
+        lp2MidY2 = lp2MidY1; lp2MidY1 = lp2Out
+
+        return lp2Out
     }
 
     /**
-     * Processes a ByteBuffer in place.
+     * Filters the side-channel sample through the cascaded HP→LP bandpass (4th order total).
+     * Returns the vocal-band component of the side signal.
+     */
+    private fun filterSideVocalBand(input: Float): Float {
+        // HP stage 1
+        val hp1Out = hp1MidB0 * input + hp1MidB1 * hp1SideX1 + hp1MidB2 * hp1SideX2 -
+                hp1MidA1 * hp1SideY1 - hp1MidA2 * hp1SideY2
+        hp1SideX2 = hp1SideX1; hp1SideX1 = input
+        hp1SideY2 = hp1SideY1; hp1SideY1 = hp1Out
+
+        // HP stage 2
+        val hp2Out = hp1MidB0 * hp1Out + hp1MidB1 * hp2SideX1 + hp1MidB2 * hp2SideX2 -
+                hp1MidA1 * hp2SideY1 - hp1MidA2 * hp2SideY2
+        hp2SideX2 = hp2SideX1; hp2SideX1 = hp1Out
+        hp2SideY2 = hp2SideY1; hp2SideY1 = hp2Out
+
+        // LP stage 1
+        val lp1Out = lp1MidB0 * hp2Out + lp1MidB1 * lp1SideX1 + lp1MidB2 * lp1SideX2 -
+                lp1MidA1 * lp1SideY1 - lp1MidA2 * lp1SideY2
+        lp1SideX2 = lp1SideX1; lp1SideX1 = hp2Out
+        lp1SideY2 = lp1SideY1; lp1SideY1 = lp1Out
+
+        // LP stage 2
+        val lp2Out = lp1MidB0 * lp1Out + lp1MidB1 * lp2SideX1 + lp1MidB2 * lp2SideX2 -
+                lp1MidA1 * lp2SideY1 - lp1MidA2 * lp2SideY2
+        lp2SideX2 = lp2SideX1; lp2SideX1 = lp1Out
+        lp2SideY2 = lp2SideY1; lp2SideY1 = lp2Out
+
+        return lp2Out
+    }
+
+    /**
+     * Processes a stereo PCM ByteBuffer in place.
+     *
+     * Gain smoothing prevents zipper noise when sliders move. Filter states
+     * persist across calls — do NOT call [reset] between consecutive buffers
+     * of the same track.
      */
     fun processPcm(
         buffer: ByteBuffer,
@@ -130,11 +216,13 @@ class VocalSeparatorDsp {
         vocalGain: Float,
         musicGain: Float,
     ) {
-        if (channels < 2) return // Vocal center extraction requires stereo
+        if (channels < 2) return
         if (!buffer.hasRemaining()) return
 
-        // Bypass check: If both gains are unity (within epsilon), no processing needed
-        if (kotlin.math.abs(vocalGain - 1.0f) < 0.005f && kotlin.math.abs(musicGain - 1.0f) < 0.005f) {
+        // Bypass: both gains at unity means the output equals the input.
+        if (kotlin.math.abs(vocalGain - 1.0f) < 0.005f &&
+            kotlin.math.abs(musicGain - 1.0f) < 0.005f
+        ) {
             return
         }
 
@@ -160,6 +248,41 @@ class VocalSeparatorDsp {
         }
     }
 
+    /**
+     * Core sample-pair processing. Applies mid/side decomposition, 4th-order
+     * bandpass isolation on both mid and side, complementary subtraction, and
+     * smoothed gain mixing. Returns the output (L, R) pair packed as a Long
+     * using Float.toBits() in the upper and lower 32 bits.
+     */
+    private fun processStereoSample(l: Float, r: Float, targetVGain: Float, targetMGain: Float): Long {
+        // Exponential gain smoothing (prevents zipper noise on slider changes)
+        smoothedVocalGain += smoothingCoeff * (targetVGain - smoothedVocalGain)
+        smoothedMusicGain += smoothingCoeff * (targetMGain - smoothedMusicGain)
+        val vG = smoothedVocalGain
+        val mG = smoothedMusicGain
+
+        // Mid/Side decomposition
+        val mid = 0.5f * (l + r)
+        val side = 0.5f * (l - r)
+
+        // 4th-order bandpass on mid (vocal center extraction)
+        val midVocal = filterMidVocalBand(mid)
+        val midMusic = mid - midVocal
+
+        // 4th-order bandpass on side (vocal off-center / reverb tails)
+        val sideVocal = filterSideVocalBand(side)
+        val sideMusic = side - sideVocal
+
+        // Reconstruct stereo with independent gains
+        val outL = (vG * (midVocal + sideVocal) + mG * (midMusic + sideMusic))
+            .coerceIn(-1.0f, 1.0f)
+        val outR = (vG * (midVocal - sideVocal) + mG * (midMusic - sideMusic))
+            .coerceIn(-1.0f, 1.0f)
+
+        // Pack two floats into a Long
+        return (outL.toBits().toLong() shl 32) or (outR.toBits().toLong() and 0xFFFFFFFFL)
+    }
+
     private fun processFloatInPlace(buffer: ByteBuffer, vGain: Float, mGain: Float) {
         var pos = buffer.position()
         val limit = buffer.limit()
@@ -167,17 +290,9 @@ class VocalSeparatorDsp {
             val l = buffer.getFloat(pos)
             val r = buffer.getFloat(pos + 4)
 
-            val m = 0.5f * (l + r)
-            val s = 0.5f * (l - r)
-
-            val vocal = filterVocalBand(m)
-            val musicMid = m - vocal
-
-            val outL = (mGain * (musicMid + s) + vGain * vocal).coerceIn(-1.0f, 1.0f)
-            val outR = (mGain * (musicMid - s) + vGain * vocal).coerceIn(-1.0f, 1.0f)
-
-            buffer.putFloat(pos, outL)
-            buffer.putFloat(pos + 4, outR)
+            val packed = processStereoSample(l, r, vGain, mGain)
+            buffer.putFloat(pos, Float.fromBits((packed ushr 32).toInt()))
+            buffer.putFloat(pos + 4, Float.fromBits(packed.toInt()))
             pos += 8
         }
     }
@@ -189,17 +304,12 @@ class VocalSeparatorDsp {
             val l = buffer.getShort(pos).toFloat() / 32768.0f
             val r = buffer.getShort(pos + 2).toFloat() / 32768.0f
 
-            val m = 0.5f * (l + r)
-            val s = 0.5f * (l - r)
+            val packed = processStereoSample(l, r, vGain, mGain)
+            val outL = Float.fromBits((packed ushr 32).toInt())
+            val outR = Float.fromBits(packed.toInt())
 
-            val vocal = filterVocalBand(m)
-            val musicMid = m - vocal
-
-            val outL = (mGain * (musicMid + s) + vGain * vocal).coerceIn(-1.0f, 1.0f)
-            val outR = (mGain * (musicMid - s) + vGain * vocal).coerceIn(-1.0f, 1.0f)
-
-            buffer.putShort(pos, (outL * 32767.0f).toInt().toShort())
-            buffer.putShort(pos + 2, (outR * 32767.0f).toInt().toShort())
+            buffer.putShort(pos, (outL * 32767.0f).toInt().coerceIn(-32767, 32767).toShort())
+            buffer.putShort(pos + 2, (outR * 32767.0f).toInt().coerceIn(-32767, 32767).toShort())
             pos += 4
         }
     }
@@ -220,14 +330,9 @@ class VocalSeparatorDsp {
             val sampleR = (b1R or (b2R shl 8) or (b3R shl 16))
             val r = sampleR.toFloat() / 8388608.0f
 
-            val m = 0.5f * (l + r)
-            val s = 0.5f * (l - r)
-
-            val vocal = filterVocalBand(m)
-            val musicMid = m - vocal
-
-            val outL = (mGain * (musicMid + s) + vGain * vocal).coerceIn(-1.0f, 1.0f)
-            val outR = (mGain * (musicMid - s) + vGain * vocal).coerceIn(-1.0f, 1.0f)
+            val packed = processStereoSample(l, r, vGain, mGain)
+            val outL = Float.fromBits((packed ushr 32).toInt())
+            val outR = Float.fromBits(packed.toInt())
 
             val scaledL = (outL * 8388607.0f).toInt().coerceIn(-8388608, 8388607)
             buffer.put(pos, scaledL.toByte())
@@ -247,20 +352,15 @@ class VocalSeparatorDsp {
         var pos = buffer.position()
         val limit = buffer.limit()
         while (pos + 7 < limit) {
-            val l = buffer.getInt(pos).toDouble() / 2147483648.0
-            val r = buffer.getInt(pos + 4).toDouble() / 2147483648.0
+            val l = buffer.getInt(pos).toFloat() / 2147483648.0f
+            val r = buffer.getInt(pos + 4).toFloat() / 2147483648.0f
 
-            val m = 0.5 * (l + r)
-            val s = 0.5 * (l - r)
+            val packed = processStereoSample(l, r, vGain, mGain)
+            val outL = Float.fromBits((packed ushr 32).toInt())
+            val outR = Float.fromBits(packed.toInt())
 
-            val vocal = filterVocalBand(m.toFloat())
-            val musicMid = m - vocal
-
-            val outL = (mGain * (musicMid + s) + vGain * vocal).coerceIn(-1.0, 1.0)
-            val outR = (mGain * (musicMid - s) + vGain * vocal).coerceIn(-1.0, 1.0)
-
-            buffer.putInt(pos, (outL * 2147483647.0).toLong().toInt())
-            buffer.putInt(pos + 4, (outR * 2147483647.0).toLong().toInt())
+            buffer.putInt(pos, (outL.toDouble() * 2147483647.0).toLong().toInt())
+            buffer.putInt(pos + 4, (outR.toDouble() * 2147483647.0).toLong().toInt())
             pos += 8
         }
     }

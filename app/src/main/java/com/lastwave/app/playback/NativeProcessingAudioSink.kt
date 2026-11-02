@@ -501,8 +501,6 @@ class NativeProcessingAudioSink(
         // payload in the same object must be equalised again.
         if (consumed) {
             directEqBuffer = null
-        vocalBuffer = null
-        vocalSeparatorController?.dsp?.reset()
             vocalBuffer = null
         }
         return consumed
