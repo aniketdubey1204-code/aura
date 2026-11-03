@@ -4,6 +4,7 @@ import io.mockk.mockk
 import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 
@@ -229,5 +230,34 @@ class YtRadioParserTest {
         assertEquals("song2", result.tracks[1].videoId)
         assertEquals("radio_cont_token", result.continuationToken)
         assertEquals("RDAMVMchained", result.automixPlaylistId)
+    }
+
+    @Test
+    fun parseRadioFilters_extractsTuningChips() {
+        val sampleJson = """
+            {
+                "contents": {
+                    "chipCloudChipRenderer": {
+                        "text": { "runs": [{ "text": "Familiar" }] },
+                        "isSelected": true,
+                        "navigationEndpoint": {
+                            "watchEndpoint": {
+                                "params": "wAEB8gECGAE%3D",
+                                "playlistId": "RDAMVMsample"
+                            }
+                        }
+                    }
+                }
+            }
+        """.trimIndent()
+
+        val root = json.parseToJsonElement(sampleJson)
+        val chips = api.parseRadioFilters(root)
+
+        assertEquals(1, chips.size)
+        assertEquals("Familiar", chips[0].title)
+        assertEquals("wAEB8gECGAE%3D", chips[0].params)
+        assertEquals("RDAMVMsample", chips[0].playlistId)
+        assertTrue(chips[0].isSelected)
     }
 }

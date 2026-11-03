@@ -105,6 +105,7 @@ class FeedViewModelChipsAndPaginationTest {
             homeRepository,
             discoverRepository,
             genresRepository,
+            userProfileRepository = io.mockk.mockk(relaxed = true),
         )
     }
 

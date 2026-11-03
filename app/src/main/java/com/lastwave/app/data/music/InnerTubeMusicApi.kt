@@ -1882,6 +1882,29 @@ class InnerTubeMusicApi @Inject constructor(
         }
     }
 
+    /** Extracts dynamic radio tuning chips (Familiar, Discover, Deep cuts, Chill, Upbeat, etc.) from radio response. */
+    internal fun parseRadioFilters(root: JsonElement): List<RadioFilterChip> {
+        val collected = mutableListOf<JsonObject>()
+        collectObjects(root, "chipCloudChipRenderer", collected)
+        return collected.mapNotNull { chip ->
+            val title = chip.obj("text")?.array("runs")?.firstOrNull()?.asObject()?.string("text")?.trim()
+                ?: chip.obj("text")?.string("simpleText")?.trim()
+            if (title.isNullOrBlank()) return@mapNotNull null
+            val isSelected = chip.bool("isSelected") ?: false
+            val navEndpoint = chip.obj("navigationEndpoint")
+            val watchEndpoint = navEndpoint?.obj("watchEndpoint")
+                ?: navEndpoint?.obj("watchPlaylistEndpoint")
+            val params = watchEndpoint?.string("params") ?: return@mapNotNull null
+            val playlistId = watchEndpoint.string("playlistId")
+            RadioFilterChip(
+                title = title,
+                params = params,
+                playlistId = playlistId,
+                isSelected = isSelected,
+            )
+        }
+    }
+
     private fun extractSetVideoId(renderer: JsonObject): String? {
         (renderer["setVideoId"] as? JsonPrimitive)?.contentOrNull?.takeIf(String::isNotBlank)?.let { return it }
         renderer.obj("playlistItemData")?.let { data ->
@@ -2112,6 +2135,7 @@ class InnerTubeMusicApi @Inject constructor(
      */
     suspend fun fetchRadio(
         videoId: String,
+        params: String = "wAEB",
     ): YtRadioResult = withContext(Dispatchers.IO) {
         if (videoId.isBlank()) return@withContext YtRadioResult(emptyList())
         val config = getWebConfig()
@@ -2122,7 +2146,7 @@ class InnerTubeMusicApi @Inject constructor(
                 put("context", context("WEB_REMIX", config.clientVersion, config.visitorData, authenticated = isAuth))
                 put("videoId", videoId)
                 put("playlistId", "RDAMVM$videoId")
-                put("params", "wAEB")
+                put("params", params)
                 put("isAudioOnly", true)
             },
             clientName = "WEB_REMIX",
@@ -2165,6 +2189,7 @@ class InnerTubeMusicApi @Inject constructor(
      */
     suspend fun fetchRadioByPlaylistId(
         playlistId: String,
+        params: String = "wAEB",
     ): YtRadioResult = withContext(Dispatchers.IO) {
         if (playlistId.isBlank()) return@withContext YtRadioResult(emptyList())
         val config = getWebConfig()
@@ -2174,7 +2199,7 @@ class InnerTubeMusicApi @Inject constructor(
             body = buildJsonObject {
                 put("context", context("WEB_REMIX", config.clientVersion, config.visitorData, authenticated = isAuth))
                 put("playlistId", playlistId)
-                put("params", "wAEB")
+                put("params", params)
                 put("isAudioOnly", true)
             },
             clientName = "WEB_REMIX",
@@ -4833,11 +4858,13 @@ class InnerTubeMusicApi @Inject constructor(
 
         val continuationToken = extractRadioContinuationToken(root)
         val automixPlaylistId = extractAutomixPlaylistId(root)
+        val filterChips = parseRadioFilters(root)
 
         return YtRadioResult(
             tracks = tracks,
             continuationToken = continuationToken,
             automixPlaylistId = automixPlaylistId,
+            filterChips = filterChips,
         )
     }
 
@@ -5447,11 +5474,13 @@ internal fun JsonObject.obj(key: String): JsonObject? = this[key] as? JsonObject
 internal fun JsonObject.array(key: String): JsonArray? = this[key] as? JsonArray
 internal fun JsonObject.string(key: String): String? = (this[key] as? JsonPrimitive)?.contentOrNull
 internal fun JsonObject.int(key: String): Int? = string(key)?.toIntOrNull()
+internal fun JsonObject.bool(key: String): Boolean? = string(key)?.toBooleanStrictOrNull()
 internal fun JsonElement.asObject(): JsonObject? = this as? JsonObject
 internal fun JsonElement.obj(key: String): JsonObject? = (this as? JsonObject)?.obj(key)
 internal fun JsonElement.array(key: String): JsonArray? = (this as? JsonObject)?.array(key)
 internal fun JsonElement.string(key: String): String? = (this as? JsonObject)?.string(key)
 internal fun JsonElement.int(key: String): Int? = (this as? JsonObject)?.int(key)
+internal fun JsonElement.bool(key: String): Boolean? = (this as? JsonObject)?.bool(key)
 
 internal fun collectObjects(element: JsonElement, key: String, output: MutableList<JsonObject>) {
     when (element) {

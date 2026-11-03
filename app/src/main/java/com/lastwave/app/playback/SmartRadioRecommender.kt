@@ -1,21 +1,21 @@
 package com.lastwave.app.playback
 
-import com.lastwave.app.data.generate.TasteProfile
 import com.lastwave.app.data.generate.TasteProfileProvider
 import com.lastwave.app.data.repository.SongPlayStatsRepository
 import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * Intelligent Up-Next radio recommender modelled after YouTube Music's autoplay algorithm.
+ * Intelligent Up-Next radio recommender that preserves YouTube Music's native neural ordering.
  *
- * It blends two critical dimensions:
- * 1. Current Seed Mood & Vibe: Preserves emotional resonance (e.g. sad, chill, energetic, romantic)
- *    and prevents acoustic whiplash.
- * 2. User's Scrobbling Profile (Last.fm & Local Play History): Integrates top artists, high-affinity
- *    tags, deep cuts the user hasn't overplayed, and eliminates tracks with high skip history.
+ * In YouTube Music, the Up Next queue is pre-sorted on the server by harmonic transition,
+ * tempo continuity, and personalized acoustic embeddings. This curator maintains that exact
+ * natural sequence while applying essential client-side hygiene:
  *
- * Implements YouTube Music's signature 2:1 discovery-to-familiarity interleaving pattern.
+ * 1. Strict Deduplication: Excludes the seed track, active queue tracks, and recently played tracks.
+ * 2. Spam & Junk Elimination: Filters out fan mashups, 1-hour loops, ringtones, and unofficial speed alterations.
+ * 3. Personalized Skip Penalty: Filters out tracks that the user has repeatedly skipped (>= 3 skips).
+ * 4. Pacing Protection: Prevents single-artist clustering by capping consecutive tracks from the same artist to 2.
  */
 @Singleton
 class SmartRadioRecommender @Inject constructor(
@@ -23,81 +23,12 @@ class SmartRadioRecommender @Inject constructor(
     private val songPlayStatsRepository: dagger.Lazy<SongPlayStatsRepository>,
 ) {
 
-    private enum class TrackMood {
-        SAD_MELANCHOLIC,
-        CHILL_AMBIENT,
-        UPBEAT_ENERGETIC,
-        ROMANTIC_LOVE,
-        DARK_INTENSE,
-        NEUTRAL,
-    }
-
-    private val sadKeywords = setOf(
-        "sad", "hurt", "cry", "crying", "lonely", "tears", "heartbreak", "broken",
-        "sorrow", "pain", "alone", "ballad", "goodbye", "acoustic", "melanchol",
-        "emo", "dark", "blue", "die", "death", "empty", "lost", "miss you",
-        "grief", "suffering", "regret", "depress", "unhappy",
-    )
-
-    private val chillKeywords = setOf(
-        "chill", "lofi", "lo-fi", "rain", "night", "sleep", "dream", "soft",
-        "slow", "calm", "breeze", "cloud", "stars", "midnight", "ambient",
-        "peaceful", "cozy", "lazy", "dusk", "dawn", "quiet", "relax", "waves",
-    )
-
-    private val upbeatKeywords = setOf(
-        "dance", "party", "club", "energy", "beat", "fast", "hype", "jump",
-        "fire", "shake", "rhythm", "electro", "rock", "workout", "bass",
-        "banger", "speed", "wild", "rave", "power", "summer", "groove",
-    )
-
-    private val romanticKeywords = setOf(
-        "love", "baby", "kiss", "forever", "hold", "mine", "romance", "darling",
-        "sweet", "romantic", "marry", "beautiful", "honey", "heart", "beloved",
-    )
-
-    private val darkKeywords = setOf(
-        "rage", "trap", "drill", "metal", "scream", "savage", "danger", "toxic",
-        "psycho", "ghost", "sinister", "shadow", "demon", "wicked", "devil",
-    )
-
     private val junkTitleKeywords = setOf(
         "mashup", "mash up", "mash-up", "jukebox", "mega mix", "megamix",
         "non stop", "nonstop", "audio jukebox", "full album", "full songs", "compilation",
         "slowed + reverb", "slowed reverb", "slowed & reverb", "bass boosted", "8d audio",
-        "karaoke", "ringtone", "instrumental", "1 hour", "10 hour", "clean version", "sped up",
+        "karaoke", "ringtone", "1 hour", "10 hour", "clean version", "sped up",
     )
-
-    private fun detectMood(text: String): TrackMood {
-        val lower = text.lowercase()
-        val tokens = lower.split(Regex("[\\s,._\\-]+")).filter { it.isNotBlank() }
-
-        var sadHits = 0
-        var chillHits = 0
-        var upbeatHits = 0
-        var romanticHits = 0
-        var darkHits = 0
-
-        for (token in tokens) {
-            if (sadKeywords.any { token.contains(it) }) sadHits++
-            if (chillKeywords.any { token.contains(it) }) chillHits++
-            if (upbeatKeywords.any { token.contains(it) }) upbeatHits++
-            if (romanticKeywords.any { token.contains(it) }) romanticHits++
-            if (darkKeywords.any { token.contains(it) }) darkHits++
-        }
-
-        val max = maxOf(sadHits, chillHits, upbeatHits, romanticHits, darkHits)
-        if (max == 0) return TrackMood.NEUTRAL
-
-        return when (max) {
-            sadHits -> TrackMood.SAD_MELANCHOLIC
-            chillHits -> TrackMood.CHILL_AMBIENT
-            upbeatHits -> TrackMood.UPBEAT_ENERGETIC
-            romanticHits -> TrackMood.ROMANTIC_LOVE
-            darkHits -> TrackMood.DARK_INTENSE
-            else -> TrackMood.NEUTRAL
-        }
-    }
 
     private fun isJunkTitle(title: String): Boolean {
         val lower = title.lowercase()
@@ -105,7 +36,7 @@ class SmartRadioRecommender @Inject constructor(
     }
 
     /**
-     * Curates and re-ranks incoming YouTube Music radio candidate tracks.
+     * Curates incoming YouTube Music radio candidate tracks while preserving their natural order.
      */
     suspend fun curateUpNextQueue(
         seedTrack: PlayableTrack,
@@ -121,32 +52,29 @@ class SmartRadioRecommender @Inject constructor(
 
         val seedVideoId = seedTrack.videoId?.takeIf(String::isNotBlank)
         val seedSongKey = PureRadioQueue.normalizedSongKey(seedTrack.title, seedTrack.artist)
-        val seedMood = detectMood("${seedTrack.title} ${seedTrack.artist}")
 
-        // 1. Fetch user's taste profile (Last.fm scrobbles, top artists, tags, deep cuts)
-        val tasteProfile: TasteProfile? = runCatching {
-            tasteProfileProvider.get().get()
-        }.getOrNull()
+        val statsRepo = runCatching { songPlayStatsRepository.get() }.getOrNull()
 
-        val topArtists = tasteProfile?.topArtistNames.orEmpty()
-        val artistAffinity = tasteProfile?.artistAffinity.orEmpty()
-        val topTrackKeys = tasteProfile?.topTrackKeys.orEmpty()
-        val topTags = tasteProfile?.topTags.orEmpty()
-
-        // 2. Base Deduplication & Hygiene Filter
+        // 1. Base Deduplication & Hygiene Filter in exact incoming sequence
         val seenVideoIds = mutableSetOf<String>()
         val seenKeys = mutableSetOf<String>()
         val seenSongKeys = mutableSetOf<String>()
 
-        val eligibleCandidates = incomingTracks.filterIndexed { index, track ->
-            val vid = track.videoId?.takeIf(String::isNotBlank) ?: return@filterIndexed false
-            if (vid == seedVideoId) return@filterIndexed false
+        val eligibleCandidates = incomingTracks.filter { track ->
+            val vid = track.videoId?.takeIf(String::isNotBlank) ?: return@filter false
+            if (vid == seedVideoId) return@filter false
 
             val key = PureRadioQueue.queueKey(track)
             val songKey = PureRadioQueue.normalizedSongKey(track.title, track.artist)
-            if (songKey == seedSongKey) return@filterIndexed false
+            if (songKey == seedSongKey) return@filter false
 
-            if (isJunkTitle(track.title)) return@filterIndexed false
+            if (isJunkTitle(track.title)) return@filter false
+
+            // Exclude tracks the user consistently skips
+            if (statsRepo != null) {
+                val skips = runCatching { statsRepo.skipCountFor(track.title, track.artist) }.getOrDefault(0)
+                if (skips >= 3) return@filter false
+            }
 
             val isDuplicate = vid in existingVideoIds ||
                 vid in recentVideoIds ||
@@ -163,125 +91,39 @@ class SmartRadioRecommender @Inject constructor(
 
         if (eligibleCandidates.isEmpty()) return emptyList()
 
-        // 3. Multi-dimensional Scoring
-        data class ScoredTrack(val track: PlayableTrack, val score: Float, val isFamiliarAnchor: Boolean)
-
-        val scoredTracks = eligibleCandidates.mapIndexed { index, track ->
-            var score = 50.0f
-            val cleanArtist = track.artist.trim().lowercase()
-            val candidateMood = detectMood("${track.title} ${track.artist}")
-
-            // A. Mood Alignment
-            if (seedMood != TrackMood.NEUTRAL) {
-                if (candidateMood == seedMood) {
-                    score += 35.0f // Strong resonance with seed track's emotional space
-                } else if (
-                    (seedMood == TrackMood.SAD_MELANCHOLIC && candidateMood == TrackMood.UPBEAT_ENERGETIC) ||
-                    (seedMood == TrackMood.UPBEAT_ENERGETIC && candidateMood == TrackMood.SAD_MELANCHOLIC)
-                ) {
-                    score -= 30.0f // Prevent mood jarring clashes
-                }
-            }
-
-            // B. Last.fm Scrobble Profile & Artist Affinity
-            val isFavoriteArtist = topArtists.any { it.equals(cleanArtist, ignoreCase = true) }
-            val affinityWeight = artistAffinity[cleanArtist]
-                ?: artistAffinity.entries.firstOrNull { it.key.equals(cleanArtist, ignoreCase = true) }?.value
-                ?: 0.0
-
-            var isFamiliar = false
-            if (isFavoriteArtist || affinityWeight > 0.25) {
-                val affinityBonus = (affinityWeight.toFloat().coerceIn(0.2f, 1.0f)) * 30.0f
-                score += affinityBonus
-
-                val isScrobbledTrack = topTrackKeys.any { it.contains(track.title, ignoreCase = true) }
-                if (!isScrobbledTrack) {
-                    // Deep Cut Discovery: Track by an artist user loves, but hasn't over-listened to
-                    score += 25.0f
-                } else {
-                    isFamiliar = true
-                    score += 15.0f
-                }
-            }
-
-            // C. Tag Match
-            if (topTags.isNotEmpty()) {
-                val matchesTag = topTags.any { tag ->
-                    track.title.contains(tag, ignoreCase = true) || track.artist.contains(tag, ignoreCase = true)
-                }
-                if (matchesTag) score += 15.0f
-            }
-
-            // D. Local Play History & Skip Penalty
-            val statsRepo = songPlayStatsRepository.get()
-            val skips = runCatching { statsRepo.skipCountFor(track.title, track.artist) }.getOrDefault(0)
-            if (skips >= 3) {
-                score -= 60.0f // User consistently skips this track
-            } else if (skips > 0) {
-                score -= (skips * 20.0f)
-            }
-
-            // E. Seed Continuity
-            if (track.artist.equals(seedTrack.artist, ignoreCase = true)) {
-                score += 12.0f
-            }
-
-            // F. Original YTM Position Decay (preserve YTM's underlying acoustic similarity)
-            val ytmPosRatio = 1.0f - (index.toFloat() / eligibleCandidates.size.toFloat())
-            score += (ytmPosRatio * 10.0f)
-
-            ScoredTrack(track = track, score = score, isFamiliarAnchor = isFamiliar || (isFavoriteArtist && score >= 75.0f))
-        }
-
-        // 4. Interleaving Engine (YouTube Music's 2 Discovery : 1 Familiarity Pattern)
-        val validScored = scoredTracks.filter { it.score > 20.0f }
-            .sortedByDescending { it.score }
-
-        val discoveries = validScored.filter { !it.isFamiliarAnchor }.map { it.track }.toMutableList()
-        val familiarAnchors = validScored.filter { it.isFamiliarAnchor }.map { it.track }.toMutableList()
-
+        // 2. Artist Pacing Guard: preserve incoming order, but prevent >2 consecutive tracks from the same artist
         val curatedResult = mutableListOf<PlayableTrack>()
-        val maxResultSize = minOf(validScored.size, 35)
+        val deferred = mutableListOf<PlayableTrack>()
 
-        // Cap consecutive songs by same artist to prevent single-artist takeover
-        val artistCounts = mutableMapOf<String, Int>()
-        fun canAddTrack(t: PlayableTrack): Boolean {
-            val count = artistCounts.getOrDefault(t.artist.lowercase(), 0)
-            return count < 3
-        }
+        for (track in eligibleCandidates) {
+            val trackArtist = track.artist.trim().lowercase()
+            val lastOneArtist = curatedResult.getOrNull(curatedResult.size - 1)?.artist?.trim()?.lowercase()
+            val lastTwoArtist = curatedResult.getOrNull(curatedResult.size - 2)?.artist?.trim()?.lowercase()
 
-        var discoveryCursor = 0
-        var familiarCursor = 0
+            val isConsecutiveOverflow = trackArtist.isNotBlank() &&
+                trackArtist == lastOneArtist &&
+                trackArtist == lastTwoArtist
 
-        while (curatedResult.size < maxResultSize && (discoveryCursor < discoveries.size || familiarCursor < familiarAnchors.size)) {
-            // Pick 2 Discoveries
-            repeat(2) {
-                if (discoveryCursor < discoveries.size && curatedResult.size < maxResultSize) {
-                    val candidate = discoveries[discoveryCursor++]
-                    if (canAddTrack(candidate)) {
-                        curatedResult.add(candidate)
-                        artistCounts[candidate.artist.lowercase()] = artistCounts.getOrDefault(candidate.artist.lowercase(), 0) + 1
+            if (isConsecutiveOverflow) {
+                deferred.add(track)
+            } else {
+                curatedResult.add(track)
+                // If a deferred track can now be placed without overflow, place it
+                if (deferred.isNotEmpty()) {
+                    val deferredTrack = deferred.first()
+                    val dArtist = deferredTrack.artist.trim().lowercase()
+                    if (dArtist != trackArtist) {
+                        curatedResult.add(deferred.removeAt(0))
                     }
                 }
             }
-
-            // Pick 1 Familiar Anchor (User's scrobble taste)
-            if (familiarCursor < familiarAnchors.size && curatedResult.size < maxResultSize) {
-                val candidate = familiarAnchors[familiarCursor++]
-                if (canAddTrack(candidate)) {
-                    curatedResult.add(candidate)
-                    artistCounts[candidate.artist.lowercase()] = artistCounts.getOrDefault(candidate.artist.lowercase(), 0) + 1
-                }
-            } else if (discoveryCursor < discoveries.size && curatedResult.size < maxResultSize) {
-                // If familiar ran out, continue with top discoveries
-                val candidate = discoveries[discoveryCursor++]
-                if (canAddTrack(candidate)) {
-                    curatedResult.add(candidate)
-                    artistCounts[candidate.artist.lowercase()] = artistCounts.getOrDefault(candidate.artist.lowercase(), 0) + 1
-                }
-            }
         }
 
-        return if (curatedResult.isNotEmpty()) curatedResult else eligibleCandidates.take(25)
+        // Append any remaining deferred tracks at the end
+        if (deferred.isNotEmpty()) {
+            curatedResult.addAll(deferred)
+        }
+
+        return curatedResult
     }
 }

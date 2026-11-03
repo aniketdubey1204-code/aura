@@ -433,6 +433,12 @@ class MusicPlayer @Inject constructor(
     private var currentRadioContinuationToken: String? = null
     @Volatile
     private var currentRadioAutomixPlaylistId: String? = null
+    @Volatile
+    private var radioStationAnchorTrack: PlayableTrack? = null
+    @Volatile
+    private var currentRadioFilterParams: String = "wAEB"
+    private val _activeRadioFilters = MutableStateFlow<List<com.lastwave.app.data.music.RadioFilterChip>>(emptyList())
+    val activeRadioFilters: StateFlow<List<com.lastwave.app.data.music.RadioFilterChip>> = _activeRadioFilters.asStateFlow()
     private var unavailableSkipJob: Job? = null
     private val unavailableMediaIds = mutableSetOf<String>()
     /**
@@ -2307,6 +2313,16 @@ class MusicPlayer @Inject constructor(
             _state.update { it.copy(isEndlessQueue = true) }
             startRadioQueue(track)
         }
+    }
+
+    /**
+     * Applies a YouTube Music radio tuning mode (e.g. Familiar, Discover, Deep cuts, Chill, Upbeat)
+     * to the active radio station without resetting playback position.
+     */
+    fun setRadioFilter(chip: com.lastwave.app.data.music.RadioFilterChip) {
+        val anchor = radioStationAnchorTrack ?: player.currentMediaItem?.toPlayableTrack() ?: return
+        currentRadioFilterParams = chip.params
+        startRadioQueue(anchor, resumePlaybackImmediately = false, params = chip.params)
     }
 
     fun playQueue(
@@ -5422,6 +5438,9 @@ class MusicPlayer @Inject constructor(
         radioUsedSeeds.clear()
         currentRadioContinuationToken = null
         currentRadioAutomixPlaylistId = null
+        radioStationAnchorTrack = null
+        currentRadioFilterParams = "wAEB"
+        _activeRadioFilters.value = emptyList()
     }
 
     private suspend fun <T> retryRadioRequest(
@@ -5447,34 +5466,64 @@ class MusicPlayer @Inject constructor(
         return null
     }
 
-    private suspend fun reseedWithLastQueueSong(
+    private suspend fun reseedRadioStation(
         currentQueue: List<PlayableTrack>,
         knownVideoIds: Set<String>,
         knownKeys: Set<String>,
         knownSongKeys: Set<String>,
         recentHistoryKeys: Set<String>,
+        currentIndex: Int = -1,
     ): List<PlayableTrack> {
-        val lastTrack = currentQueue.lastOrNull { !it.videoId.isNullOrBlank() }
-        val lastVideoId = lastTrack?.videoId
-        if (lastVideoId == null || lastVideoId in radioUsedSeeds) {
+        val anchor = radioStationAnchorTrack
+        val currentTrack = if (currentIndex in currentQueue.indices) currentQueue[currentIndex] else null
+        val candidateSeeds = mutableListOf<PlayableTrack>()
+
+        if (currentTrack?.videoId != null && currentTrack.videoId !in radioUsedSeeds) {
+            candidateSeeds.add(currentTrack)
+        }
+        if (anchor?.videoId != null && anchor.videoId !in radioUsedSeeds) {
+            candidateSeeds.add(anchor)
+        }
+        if (anchor != null) {
+            val sameArtist = currentQueue.filter {
+                it.videoId != null && it.videoId !in radioUsedSeeds &&
+                    it.artist.equals(anchor.artist, ignoreCase = true)
+            }
+            candidateSeeds.addAll(sameArtist)
+        }
+        val window = if (currentIndex >= 0) {
+            currentQueue.subList((currentIndex - 3).coerceAtLeast(0), (currentIndex + 4).coerceAtMost(currentQueue.size))
+        } else {
+            currentQueue.takeLast(10)
+        }
+        candidateSeeds.addAll(window.filter { it.videoId != null && it.videoId !in radioUsedSeeds })
+
+        val nextSeed = candidateSeeds.firstOrNull() ?: currentQueue.lastOrNull {
+            !it.videoId.isNullOrBlank() && it.videoId !in radioUsedSeeds
+        }
+
+        val seedVideoId = nextSeed?.videoId
+        if (seedVideoId == null) {
             android.util.Log.d("MusicPlayer", "No fresh seed track available for radio re-seeding; stopping extending quietly")
             return emptyList()
         }
-        radioUsedSeeds.add(lastVideoId)
-        android.util.Log.i("MusicPlayer", "Re-seeding YTM radio with RDAMVM of last track in queue: $lastVideoId")
-        val reseedResult = retryRadioRequest { innerTube.fetchRadio(lastVideoId) }
+
+        radioUsedSeeds.add(seedVideoId)
+        android.util.Log.i("MusicPlayer", "Re-seeding YTM radio anchored around: ${nextSeed.title} - ${nextSeed.artist} ($seedVideoId)")
+        val reseedResult = retryRadioRequest { innerTube.fetchRadio(seedVideoId, params = currentRadioFilterParams) }
         return if (reseedResult != null && reseedResult.tracks.isNotEmpty()) {
             currentRadioContinuationToken = reseedResult.continuationToken
             currentRadioAutomixPlaylistId = reseedResult.automixPlaylistId
-            PureRadioQueue.filterStrictYtmRadioBatch(
-                incomingTracks = reseedResult.tracks.map { it.toPlayableTrack() },
+            if (reseedResult.filterChips.isNotEmpty()) {
+                _activeRadioFilters.value = reseedResult.filterChips
+            }
+            curateRadioBatch(
+                seed = anchor ?: nextSeed,
+                incoming = reseedResult.tracks.map { it.toPlayableTrack() },
                 existingVideoIds = knownVideoIds,
                 existingKeys = knownKeys,
                 existingSongKeys = knownSongKeys,
-                recentVideoIds = recentHistoryKeys,
-                recentKeys = recentHistoryKeys,
-                seedVideoId = lastVideoId,
-                seedSongKey = PureRadioQueue.normalizedSongKey(lastTrack.title, lastTrack.artist),
+                recentHistoryKeys = recentHistoryKeys,
             )
         } else {
             android.util.Log.d("MusicPlayer", "Re-seeding with RDAMVM returned no tracks; stopping extending quietly")
@@ -5515,7 +5564,11 @@ class MusicPlayer @Inject constructor(
         }
     }
 
-    private fun startRadioQueue(seed: PlayableTrack, resumePlaybackImmediately: Boolean = false) {
+    private fun startRadioQueue(
+        seed: PlayableTrack,
+        resumePlaybackImmediately: Boolean = false,
+        params: String = currentRadioFilterParams,
+    ) {
         // Podcast episodes are not radio seeds: a podcast queue never grows
         // with related songs, it is a finite list the user picked.
         if (seed.mediaType != MediaType.SONG) return
@@ -5523,6 +5576,8 @@ class MusicPlayer @Inject constructor(
         radioUsedSeeds.clear()
         currentRadioContinuationToken = null
         currentRadioAutomixPlaylistId = null
+        radioStationAnchorTrack = seed
+        currentRadioFilterParams = params
         seed.videoId?.takeIf(String::isNotBlank)?.let { radioUsedSeeds.add(it) }
 
         val expectedGeneration = playRequestGeneration.get()
@@ -5551,12 +5606,15 @@ class MusicPlayer @Inject constructor(
                     val recentHistoryKeys = playHistory.takeLast(50).toSet()
 
                     val toAdd: List<PlayableTrack> = if (seedVideoId != null) {
-                        val radioResult = retryRadioRequest { innerTube.fetchRadio(seedVideoId) }
+                        val radioResult = retryRadioRequest { innerTube.fetchRadio(seedVideoId, params = currentRadioFilterParams) }
                         if (expectedGeneration != playRequestGeneration.get() || !radioQueueActive) return@withLock
 
                         if (radioResult != null && radioResult.tracks.isNotEmpty()) {
                             currentRadioContinuationToken = radioResult.continuationToken
                             currentRadioAutomixPlaylistId = radioResult.automixPlaylistId
+                            if (radioResult.filterChips.isNotEmpty()) {
+                                _activeRadioFilters.value = radioResult.filterChips
+                            }
                             curateRadioBatch(
                                 seed = seed,
                                 incoming = radioResult.tracks.map { it.toPlayableTrack() },
@@ -5567,12 +5625,15 @@ class MusicPlayer @Inject constructor(
                             )
                         } else if (radioResult != null && !radioResult.automixPlaylistId.isNullOrBlank()) {
                             val automixId = radioResult.automixPlaylistId.orEmpty()
-                            val automixResult = retryRadioRequest { innerTube.fetchRadioByPlaylistId(automixId) }
+                            val automixResult = retryRadioRequest { innerTube.fetchRadioByPlaylistId(automixId, params = currentRadioFilterParams) }
                             if (expectedGeneration != playRequestGeneration.get() || !radioQueueActive) return@withLock
 
                             if (automixResult != null && automixResult.tracks.isNotEmpty()) {
                                 currentRadioContinuationToken = automixResult.continuationToken
                                 currentRadioAutomixPlaylistId = automixResult.automixPlaylistId
+                                if (automixResult.filterChips.isNotEmpty()) {
+                                    _activeRadioFilters.value = automixResult.filterChips
+                                }
                                 curateRadioBatch(
                                     seed = seed,
                                     incoming = automixResult.tracks.map { it.toPlayableTrack() },
@@ -5692,7 +5753,10 @@ class MusicPlayer @Inject constructor(
                         if (result.automixPlaylistId != null) {
                             currentRadioAutomixPlaylistId = result.automixPlaylistId
                         }
-                        val currentSeed = currentQueue.getOrNull(currentIndex) ?: currentQueue.first()
+                        if (result.filterChips.isNotEmpty()) {
+                            _activeRadioFilters.value = result.filterChips
+                        }
+                        val currentSeed = radioStationAnchorTrack ?: currentQueue.getOrNull(currentIndex) ?: currentQueue.first()
                         curateRadioBatch(
                             seed = currentSeed,
                             incoming = result.tracks.map { it.toPlayableTrack() },
@@ -5704,13 +5768,16 @@ class MusicPlayer @Inject constructor(
                     } else if (!automixId.isNullOrBlank()) {
                         currentRadioContinuationToken = null
                         currentRadioAutomixPlaylistId = null
-                        val automixResult = retryRadioRequest { innerTube.fetchRadioByPlaylistId(automixId) }
+                        val automixResult = retryRadioRequest { innerTube.fetchRadioByPlaylistId(automixId, params = currentRadioFilterParams) }
                         if (expectedGeneration != playRequestGeneration.get() || !radioQueueActive) return@launch
 
                         if (automixResult != null && automixResult.tracks.isNotEmpty()) {
                             currentRadioContinuationToken = automixResult.continuationToken
                             currentRadioAutomixPlaylistId = automixResult.automixPlaylistId
-                            val currentSeed = currentQueue.getOrNull(currentIndex) ?: currentQueue.first()
+                            if (automixResult.filterChips.isNotEmpty()) {
+                                _activeRadioFilters.value = automixResult.filterChips
+                            }
+                            val currentSeed = radioStationAnchorTrack ?: currentQueue.getOrNull(currentIndex) ?: currentQueue.first()
                             curateRadioBatch(
                                 seed = currentSeed,
                                 incoming = automixResult.tracks.map { it.toPlayableTrack() },
@@ -5720,21 +5787,24 @@ class MusicPlayer @Inject constructor(
                                 recentHistoryKeys = recentHistoryKeys,
                             )
                         } else {
-                            reseedWithLastQueueSong(currentQueue, knownVideoIds, knownKeys, knownSongKeys, recentHistoryKeys)
+                            reseedRadioStation(currentQueue, knownVideoIds, knownKeys, knownSongKeys, recentHistoryKeys, currentIndex)
                         }
                     } else {
                         currentRadioContinuationToken = null
-                        reseedWithLastQueueSong(currentQueue, knownVideoIds, knownKeys, knownSongKeys, recentHistoryKeys)
+                        reseedRadioStation(currentQueue, knownVideoIds, knownKeys, knownSongKeys, recentHistoryKeys, currentIndex)
                     }
                 } else if (!automixId.isNullOrBlank()) {
                     currentRadioAutomixPlaylistId = null
-                    val automixResult = retryRadioRequest { innerTube.fetchRadioByPlaylistId(automixId) }
+                    val automixResult = retryRadioRequest { innerTube.fetchRadioByPlaylistId(automixId, params = currentRadioFilterParams) }
                     if (expectedGeneration != playRequestGeneration.get() || !radioQueueActive) return@launch
 
                     if (automixResult != null && automixResult.tracks.isNotEmpty()) {
                         currentRadioContinuationToken = automixResult.continuationToken
                         currentRadioAutomixPlaylistId = automixResult.automixPlaylistId
-                        val currentSeed = currentQueue.getOrNull(currentIndex) ?: currentQueue.first()
+                        if (automixResult.filterChips.isNotEmpty()) {
+                            _activeRadioFilters.value = automixResult.filterChips
+                        }
+                        val currentSeed = radioStationAnchorTrack ?: currentQueue.getOrNull(currentIndex) ?: currentQueue.first()
                         curateRadioBatch(
                             seed = currentSeed,
                             incoming = automixResult.tracks.map { it.toPlayableTrack() },
@@ -5744,10 +5814,10 @@ class MusicPlayer @Inject constructor(
                             recentHistoryKeys = recentHistoryKeys,
                         )
                     } else {
-                        reseedWithLastQueueSong(currentQueue, knownVideoIds, knownKeys, knownSongKeys, recentHistoryKeys)
+                        reseedRadioStation(currentQueue, knownVideoIds, knownKeys, knownSongKeys, recentHistoryKeys, currentIndex)
                     }
                 } else {
-                    reseedWithLastQueueSong(currentQueue, knownVideoIds, knownKeys, knownSongKeys, recentHistoryKeys)
+                    reseedRadioStation(currentQueue, knownVideoIds, knownKeys, knownSongKeys, recentHistoryKeys, currentIndex)
                 }
 
                 if (toAdd.isEmpty() || !radioQueueActive || expectedGeneration != playRequestGeneration.get()) return@launch

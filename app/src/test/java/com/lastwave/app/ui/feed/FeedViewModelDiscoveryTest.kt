@@ -82,6 +82,7 @@ class FeedViewModelDiscoveryTest {
             homeRepository,
             discoverRepository,
             genresRepository,
+            userProfileRepository = io.mockk.mockk(relaxed = true),
         )
 
         assertThat(viewModel.discoveryTracks.value).containsExactly(mockTrack)
@@ -104,6 +105,7 @@ class FeedViewModelDiscoveryTest {
             homeRepository,
             discoverRepository,
             genresRepository,
+            userProfileRepository = io.mockk.mockk(relaxed = true),
         )
 
         assertThat(viewModel.discoveryTracks.value).isEmpty()
