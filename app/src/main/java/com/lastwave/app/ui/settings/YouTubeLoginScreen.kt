@@ -73,15 +73,6 @@ fun YouTubeLoginScreen(
     var showCookieDialog by remember { mutableStateOf(false) }
     var activeWebView by remember { mutableStateOf<WebView?>(null) }
 
-    LaunchedEffect(Unit) {
-        runCatching {
-            val cm = CookieManager.getInstance()
-            cm.removeAllCookies(null)
-            cm.flush()
-            android.webkit.WebStorage.getInstance().deleteAllData()
-        }
-    }
-
     LaunchedEffect(state.connectedName, state.verifying, activeWebView) {
         if (state.connectedName != null || state.verifying) return@LaunchedEffect
         while (true) {
@@ -143,9 +134,9 @@ fun YouTubeLoginScreen(
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
                         settings.databaseEnabled = true
-                        clearCache(true)
-                        clearHistory()
-                        clearFormData()
+                        settings.saveFormData = true
+                        settings.cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
+                        importantForAutofill = android.view.View.IMPORTANT_FOR_AUTOFILL_YES
                         // Google blocks the default WebView user agent on
                         // accounts.google.com ("may not be secure"). Stripping
                         // embedded WebView markers ("; wv" and "Version/4.0" / "Version/X.X")

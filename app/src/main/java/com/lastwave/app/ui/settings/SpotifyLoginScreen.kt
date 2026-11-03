@@ -255,6 +255,7 @@ fun SpotifyLoginScreen(
                                     javaScriptEnabled = true
                                     domStorageEnabled = true
                                     databaseEnabled = true
+                                    saveFormData = true
                                     mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                                     cacheMode = WebSettings.LOAD_DEFAULT
                                     // Keep the default user agent: the accounts page
@@ -262,6 +263,7 @@ fun SpotifyLoginScreen(
                                     // the WebView client hints still say WebView.
                                     setSupportMultipleWindows(false)
                                 }
+                                importantForAutofill = android.view.View.IMPORTANT_FOR_AUTOFILL_YES
 
                                 val cm = CookieManager.getInstance()
                                 cm.setAcceptCookie(true)
