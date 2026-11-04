@@ -33,6 +33,7 @@ class AuraApplication : Application(), ImageLoaderFactory {
     @Inject lateinit var trackDownloadManager: dagger.Lazy<com.lastwave.app.data.download.TrackDownloadManager>
     @Inject lateinit var discordPresenceManager: dagger.Lazy<com.lastwave.app.presence.DiscordPresenceManager>
     @Inject lateinit var appLocaleManager: dagger.Lazy<com.lastwave.app.util.AppLocaleManager>
+    @Inject lateinit var auraConnectManager: dagger.Lazy<com.lastwave.app.playback.connect.AuraConnectManager>
 
     override fun attachBaseContext(base: Context) {
         // Pin the selected locale before any component (providers, services,
@@ -131,6 +132,12 @@ class AuraApplication : Application(), ImageLoaderFactory {
             delay(OPTIONAL_STARTUP_DELAY_MS)
             runCatching { discordPresenceManager.get().start() }
                 .onFailure { com.lastwave.app.diagnostics.AppLog.e("LastWaveStartup", "Discord presence startup disabled", it) }
+        }
+        // Aura Connect: background device continuity and Spotify Connect-style remote control
+        applicationScope.launch {
+            delay(OPTIONAL_STARTUP_DELAY_MS)
+            runCatching { auraConnectManager.get().start() }
+                .onFailure { com.lastwave.app.diagnostics.AppLog.e("AuraStartup", "Aura Connect startup disabled", it) }
         }
         // A widget is a separate RemoteViews surface, so it needs an explicit
         // refresh whenever LastWave's live theme changes. The widget's palette
