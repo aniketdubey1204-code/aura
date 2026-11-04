@@ -279,14 +279,15 @@ class AuraConnectManager @Inject constructor(
 
                     scope.launch(Dispatchers.Main) {
                         when (action) {
-                            "play" -> musicPlayer.play()
+                            "play" -> musicPlayer.resume()
                             "pause" -> musicPlayer.pause()
+                            "toggle" -> musicPlayer.togglePlayPause()
                             "seek" -> {
                                 val pos = actionJson.optLong("positionMs", 0L)
                                 musicPlayer.seekTo(pos)
                             }
-                            "skip_next", "next" -> musicPlayer.skipToNext()
-                            "skip_previous", "previous" -> musicPlayer.skipToPrevious()
+                            "skip_next", "next" -> musicPlayer.next()
+                            "skip_previous", "previous" -> musicPlayer.previous()
                             "volume", "set_volume" -> {
                                 val vol = actionJson.optDouble("value", 1.0)
                                 setVolumeFraction(vol)
