@@ -2681,7 +2681,7 @@ private fun FullPlayer(
                             presentationAlpha = { heroAlpha },
                             onCoverChanged = { canvasCover = it },
                             onAspectRatioChanged = { canvasAspect = it },
-                            pausedForTransition = shownDismissY > 1f || currentTab != FullPlayerTab.NOW_PLAYING,
+                            pausedForTransition = shownDismissY > 40f || currentTab != FullPlayerTab.NOW_PLAYING,
                             modifier = if (isTallCanvas) {
                                 Modifier.fillMaxSize()
                             } else {
@@ -3279,7 +3279,7 @@ private fun FullPlayer(
                                                     corner = 22.dp,
                                                     canvas = if (showSleeveCanvas) canvas else null,
                                                     isPlaying = state.isPlaying,
-                                                    pausedForTransition = shownDismissY > 1f || currentTab != FullPlayerTab.NOW_PLAYING,
+                                                    pausedForTransition = shownDismissY > 40f || currentTab != FullPlayerTab.NOW_PLAYING,
                                                     onAspectRatioChanged = { canvasAspect = it },
                                                 )
                                             }
@@ -3871,7 +3871,7 @@ private fun FullPlayerLandscape(
                         corner = 24.dp,
                         canvas = if (showSleeveCanvas) canvas else null,
                         isPlaying = state.isPlaying,
-                        pausedForTransition = shownDismissY > 1f,
+                        pausedForTransition = shownDismissY > 40f,
                         onAspectRatioChanged = { canvasAspect = it },
                     )
                 }

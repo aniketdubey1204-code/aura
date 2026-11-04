@@ -47,6 +47,7 @@ import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import com.lastwave.app.data.canvas.CANVAS_UA
@@ -107,7 +108,7 @@ fun CanvasArtworkPlayer(
     var rendered by remember(canvas) { mutableStateOf(false) }
     var clipAspect by remember(canvas) { mutableFloatStateOf(0f) }
     var bounds by remember { mutableStateOf(IntSize.Zero) }
-    var textureView by remember(canvas) { mutableStateOf<TextureView?>(null) }
+    var textureView by remember { mutableStateOf<TextureView?>(null) }
     var frameTick by remember(canvas) { mutableIntStateOf(0) }
     var surfaceGeneration by remember(canvas) { mutableIntStateOf(0) }
 
@@ -124,12 +125,24 @@ fun CanvasArtworkPlayer(
         val upstream = DefaultDataSource.Factory(context, httpFactory)
         val cachedFactory = CanvasCache.dataSourceFactory(context, upstream)
 
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(
+                /* minBufferMs = */ 1_500,
+                /* maxBufferMs = */ 6_000,
+                /* bufferForPlaybackMs = */ 500,
+                /* bufferForPlaybackAfterRebufferMs = */ 1_000,
+            )
+            .setPrioritizeTimeOverSizeThresholds(true)
+            .build()
+
         ExoPlayer.Builder(context)
             .setMediaSourceFactory(DefaultMediaSourceFactory(cachedFactory))
+            .setLoadControl(loadControl)
             .build()
             .apply {
                 volume = 0f
                 repeatMode = Player.REPEAT_MODE_ONE
+                videoScalingMode = C.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING
                 trackSelectionParameters = trackSelectionParameters.buildUpon()
                     .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, true)
                     .build()
@@ -147,6 +160,10 @@ fun CanvasArtworkPlayer(
                 clipAspect = aspect
                 reportAspect(aspect)
                 textureView?.applyContentTransform(clipAspect, currentContentMode, currentAlignPortraitTop)
+            }
+
+            override fun onRenderedFirstFrame() {
+                rendered = true
             }
 
             override fun onPlayerError(error: PlaybackException) {
@@ -178,8 +195,8 @@ fun CanvasArtworkPlayer(
     }
 
     val foreground = rememberIsForeground()
-    LaunchedEffect(foreground, pausedForTransition) {
-        player.playWhenReady = foreground && !pausedForTransition
+    LaunchedEffect(isPlaying, foreground, pausedForTransition) {
+        player.playWhenReady = isPlaying && foreground && !pausedForTransition
     }
 
     LaunchedEffect(surfaceGeneration) {
@@ -306,18 +323,17 @@ fun CanvasArtworkPlayer(
         },
         update = { frame ->
             val view = frame.getChildAt(0) as TextureView
+            if (textureView !== view) {
+                textureView = view
+            }
             view.alpha = if (contentMode == CanvasContentMode.FIT_PORTRAIT && clipAspect <= 0f) {
                 0f
             } else {
                 alpha * presentationAlpha()
             }
             view.applyContentTransform(clipAspect, contentMode, alignPortraitTop)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                view.setBottomFade(bottomFade, bounds, bottomFadeEndPx)
-            } else {
-                frame.fadeFraction = bottomFade
-                frame.fadeEndPx = bottomFadeEndPx
-            }
+            frame.fadeFraction = bottomFade
+            frame.fadeEndPx = bottomFadeEndPx
         },
         modifier = modifier.onSizeChanged { bounds = it },
     )

@@ -120,7 +120,7 @@ class DualDeckTransportCoordinator @Inject constructor(
         val remainingMs = durationMs - positionMs
 
         // 1. Look-ahead pre-analysis trigger: 25% progress or 90s remaining
-        if (durationMs > 30_000L && remainingMs in 1L..75_000L && nextTrack != null) {
+        if (((durationMs > 20_000L && remainingMs in 1L..90_000L) || (durationMs in 1L..20_000L && remainingMs > 0L)) && nextTrack != null) {
             if (_telemetry.value.phase == BlendPhase.IDLE) {
                 _telemetry.update {
                     it.copy(
@@ -167,7 +167,7 @@ class DualDeckTransportCoordinator @Inject constructor(
 
         // 2. Automatic Fallback Plan (Never miss a transition window)
         val fallbackDurationMs = (currentSettings.targetDurationSeconds * 1000L).coerceIn(8_000L, 25_000L)
-        if (durationMs > 30_000L && remainingMs in 1L..40_000L && remainingMs <= fallbackDurationMs + 1000L && nextTrack != null) {
+        if (durationMs > 10_000L && remainingMs in 1L..60_000L && remainingMs <= fallbackDurationMs + 5000L && nextTrack != null) {
             val plan = currentSplicePlan
             if (plan == null || plan.isBypass) {
                 val safePlan = SplicePlan(
@@ -191,16 +191,20 @@ class DualDeckTransportCoordinator @Inject constructor(
 
         // 3. Trigger Splice at Splice Horizon
         val plan = currentSplicePlan
-        if (plan != null && !plan.isBypass && (_telemetry.value.phase == BlendPhase.ARMED || _telemetry.value.phase == BlendPhase.PRE_ANALYZING)) {
+        if (plan != null && !plan.isBypass && (_telemetry.value.phase == BlendPhase.ARMED || _telemetry.value.phase == BlendPhase.PRE_ANALYZING || _telemetry.value.phase == BlendPhase.IDLE)) {
             val effectiveCueOut = if (durationMs > 40_000L && plan.cueOutStartMs < durationMs - 40_000L) {
                 maxOf(0L, durationMs - plan.durationMs).coerceAtLeast(durationMs - 40_000L)
             } else {
                 plan.cueOutStartMs
             }
-            val isInEndingWindow = durationMs > 30_000L && remainingMs in 1L..40_000L
+            val isInEndingWindow = (durationMs > 20_000L && remainingMs in 1L..60_000L) || (durationMs in 1L..20_000L && remainingMs > 0L)
             val shouldTrigger = isInEndingWindow && (positionMs >= effectiveCueOut || remainingMs <= plan.durationMs)
             if (shouldTrigger && secondaryPlayer != null) {
-                val isSecondaryReady = secondaryPlayer.playbackState == Player.STATE_READY
+                if (secondaryPlayer.playbackState == Player.STATE_IDLE && secondaryPlayer.mediaItemCount > 0) {
+                    secondaryPlayer.prepare()
+                }
+                val isSecondaryReady = secondaryPlayer.playbackState == Player.STATE_READY ||
+                    (secondaryPlayer.playbackState == Player.STATE_BUFFERING && secondaryPlayer.playerError == null)
                 if (isSecondaryReady) {
                     startBlendExecution(primaryPlayer, secondaryPlayer, plan.copy(cueOutStartMs = effectiveCueOut))
                 }

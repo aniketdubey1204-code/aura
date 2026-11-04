@@ -1925,39 +1925,46 @@ class MusicPlayer @Inject constructor(
                             val transitionActive = crossfadeEnabled || autoMixCoordinator.get().isEnabled
                             if (transitionActive && upcomingIdx != C.INDEX_UNSET && nextItem != null) {
                                 val remainingMs = dur - pos
-                                if (dur > 30_000L && remainingMs in 1L..75_000L) {
-                                    val isNextNonPlaceholder = nextItem.localConfiguration?.uri?.scheme?.let { it != "lastwave" } == true
-                                    val isStreamDead = stream?.isExpired() == true
-                                    val isNextResolved = isNextNonPlaceholder && !isStreamDead
+                                val isNextNonPlaceholder = nextItem.localConfiguration?.uri?.scheme?.let { it != "lastwave" } == true
+                                val isStreamDead = stream?.isExpired() == true
+                                val isNextResolved = isNextNonPlaceholder && !isStreamDead
 
-                                    if (!isNextResolved) {
-                                        val nowMs = SystemClock.elapsedRealtime()
-                                        val dueForKick = lastCrossfadeResolveIndex != upcomingIdx ||
-                                            nowMs - lastCrossfadeResolveKickMs >= CROSSFADE_RESOLVE_RETRY_MS
-                                        if (dueForKick && preloadJob?.isActive != true) {
-                                            lastCrossfadeResolveIndex = upcomingIdx
-                                            lastCrossfadeResolveKickMs = nowMs
-                                            preloadNextTrack(upcomingIdx, nextTrk)
-                                        }
-                                    } else {
-                                        standbyOrCreate()
-                                        if (!crossfadeStandbyArmed || standbyIndex != upcomingIdx) {
-                                            armCrossfadeStandby(upcomingIdx, nextItem)
-                                        }
+                                if (isNextResolved) {
+                                    val standby = currentStandby()
+                                    val standbyItem = standby?.currentMediaItem
+                                    val needsArm = !crossfadeStandbyArmed ||
+                                        standbyIndex != upcomingIdx ||
+                                        standbyItem?.mediaId != nextItem.mediaId ||
+                                        standbyItem?.localConfiguration?.uri?.scheme == "lastwave"
+                                    if (needsArm) {
+                                        armCrossfadeStandby(upcomingIdx, nextItem)
+                                    }
+                                } else if ((dur > 30_000L && remainingMs in 1L..90_000L) || dur <= 30_000L) {
+                                    val nowMs = SystemClock.elapsedRealtime()
+                                    val dueForKick = lastCrossfadeResolveIndex != upcomingIdx ||
+                                        nowMs - lastCrossfadeResolveKickMs >= CROSSFADE_RESOLVE_RETRY_MS
+                                    if (dueForKick && preloadJob?.isActive != true) {
+                                        lastCrossfadeResolveIndex = upcomingIdx
+                                        lastCrossfadeResolveKickMs = nowMs
+                                        preloadNextTrack(upcomingIdx, nextTrk)
                                     }
                                 }
                             }
 
+                            val activeStandby = currentStandby() ?: if (transitionActive && upcomingIdx != C.INDEX_UNSET) standbyOrCreate() else null
                             autoMixCoordinator.get().onTrackProgressTick(
                                 primaryPlayer = player,
-                                secondaryPlayer = currentStandby(),
+                                secondaryPlayer = activeStandby,
                                 currentTrack = _state.value.current,
                                 nextTrack = nextTrk,
                                 positionMs = pos,
                                 durationMs = dur,
                                 nextTrackStreamUrl = nextStreamUrl,
                             )
-                            if (updateCrossfade(pos)) {
+                            val autoMixActive = autoMixCoordinator.get().isEnabled &&
+                                (_state.value.deckBlendTelemetry.isArmedOrBlending ||
+                                 (dur > 10_000L && (dur - pos) in 1L..60_000L))
+                            if (updateCrossfade(pos) || autoMixActive) {
                                 cadenceMs = 60L
                             } else {
 
@@ -3345,6 +3352,7 @@ class MusicPlayer @Inject constructor(
         val isAlreadySet = standby.mediaItemCount == standbyQueue.size &&
             standby.currentMediaItemIndex == nextIndex &&
             standby.currentMediaItem?.mediaId == nextItem.mediaId &&
+            standby.currentMediaItem?.localConfiguration?.uri?.scheme != "lastwave" &&
             standby.playbackState != Player.STATE_IDLE
         if (!isAlreadySet) {
             standby.pause()
@@ -4410,9 +4418,16 @@ class MusicPlayer @Inject constructor(
                 player.setShuffleOrder(DefaultShuffleOrder(order.toIntArray(), Random.nextLong()))
             }
         }
-        val standby = secondaryPlayer
+        val standby = currentStandby()
         if (standby != null && crossfadeStandbyArmed && index in 0 until standby.mediaItemCount) {
             standby.replaceMediaItem(index, mediaItem)
+            if (standby.currentMediaItemIndex == index && standby.playbackState == Player.STATE_IDLE) {
+                standby.prepare()
+            }
+        }
+        val transitionActive = crossfadeEnabled || autoMixCoordinator.get().isEnabled
+        if (transitionActive && index == player.nextMediaItemIndex && mediaItem.localConfiguration?.uri?.scheme != "lastwave") {
+            armCrossfadeStandby(index, mediaItem)
         }
     }
 
