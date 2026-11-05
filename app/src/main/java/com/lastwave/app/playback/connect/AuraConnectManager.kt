@@ -269,62 +269,72 @@ class AuraConnectManager @Inject constructor(
                 return resp
             }
 
-            if (uri == "/aura-connect/action" && method == Method.POST) {
+            if (uri == "/aura-connect/action" && (method == Method.POST || method == Method.GET)) {
                 val bodyMap = HashMap<String, String>()
                 try {
                     session.parseBody(bodyMap)
-                    val postData = bodyMap["postData"] ?: ""
-                    val actionJson = if (postData.isNotBlank()) JSONObject(postData) else JSONObject()
-                    val action = actionJson.optString("action", "")
+                } catch (e: Exception) {
+                    Log.w(TAG, "NanoHTTPD parseBody failed: ${e.message}")
+                }
+                val postData = bodyMap["postData"] ?: ""
+                val actionJson = if (postData.isNotBlank()) {
+                    try { JSONObject(postData) } catch (_: Exception) { JSONObject() }
+                } else JSONObject()
 
-                    scope.launch(Dispatchers.Main) {
-                        when (action) {
-                            "play" -> musicPlayer.resume()
-                            "pause" -> musicPlayer.pause()
-                            "toggle" -> musicPlayer.togglePlayPause()
-                            "seek" -> {
-                                val pos = actionJson.optLong("positionMs", 0L)
-                                musicPlayer.seekTo(pos)
+                val action = (if (actionJson.has("action")) actionJson.optString("action") else null)
+                    ?: session.parms["action"]
+                    ?: ""
+
+                Log.d(TAG, "AuraConnect action received: $action (parms=${session.parms})")
+
+                scope.launch(Dispatchers.Main) {
+                    when (action) {
+                        "play" -> musicPlayer.resume()
+                        "pause" -> musicPlayer.pause()
+                        "toggle" -> musicPlayer.togglePlayPause()
+                        "seek" -> {
+                            val pos = if (actionJson.has("positionMs")) {
+                                actionJson.optLong("positionMs", 0L)
+                            } else {
+                                session.parms["positionMs"]?.toLongOrNull() ?: 0L
                             }
-                            "skip_next", "next" -> musicPlayer.next()
-                            "skip_previous", "previous" -> musicPlayer.previous()
-                            "volume", "set_volume" -> {
-                                val vol = actionJson.optDouble("value", 1.0)
-                                setVolumeFraction(vol)
+                            musicPlayer.seekTo(pos)
+                        }
+                        "skip_next", "next" -> musicPlayer.next()
+                        "skip_previous", "previous" -> musicPlayer.previous()
+                        "volume", "set_volume" -> {
+                            val vol = if (actionJson.has("value")) {
+                                actionJson.optDouble("value", 1.0)
+                            } else {
+                                session.parms["value"]?.toDoubleOrNull() ?: 1.0
                             }
-                            "play_track" -> {
-                                val tObj = actionJson.optJSONObject("track")
-                                if (tObj != null) {
-                                    val newTrack = PlayableTrack(
-                                        title = tObj.optString("title", "Unknown"),
-                                        artist = tObj.optString("artist", "Unknown"),
-                                        album = tObj.optString("album", "").takeIf { it.isNotBlank() },
-                                        artworkUrl = tObj.optString("artworkUrl", "").takeIf { it.isNotBlank() },
-                                        videoId = tObj.optString("videoId", "").takeIf { it.isNotBlank() },
-                                        durationMs = tObj.optLong("durationMs", 0L).takeIf { it > 0 },
-                                    )
-                                    musicPlayer.play(track = newTrack, sourceLabel = "Aura Connect")
-                                }
+                            setVolumeFraction(vol)
+                        }
+                        "play_track" -> {
+                            val tObj = actionJson.optJSONObject("track") ?: actionJson
+                            val title = tObj.optString("title", session.parms["title"] ?: "")
+                            if (title.isNotBlank()) {
+                                val newTrack = PlayableTrack(
+                                    title = title,
+                                    artist = tObj.optString("artist", session.parms["artist"] ?: "Unknown"),
+                                    album = tObj.optString("album", session.parms["album"] ?: "").takeIf { it.isNotBlank() },
+                                    artworkUrl = tObj.optString("artworkUrl", session.parms["artworkUrl"] ?: "").takeIf { it.isNotBlank() },
+                                    videoId = tObj.optString("videoId", session.parms["videoId"] ?: "").takeIf { it.isNotBlank() },
+                                    durationMs = tObj.optLong("durationMs", session.parms["durationMs"]?.toLongOrNull() ?: 0L).takeIf { it > 0 },
+                                )
+                                musicPlayer.play(track = newTrack, sourceLabel = "Aura Connect")
                             }
                         }
                     }
-
-                    val resp = newFixedLengthResponse(
-                        Response.Status.OK,
-                        "application/json",
-                        JSONObject().put("status", "accepted").put("action", action).toString(),
-                    )
-                    addCorsHeaders(resp)
-                    return resp
-                } catch (e: Exception) {
-                    val resp = newFixedLengthResponse(
-                        Response.Status.BAD_REQUEST,
-                        "application/json",
-                        JSONObject().put("error", e.message ?: "Failed to parse action").toString(),
-                    )
-                    addCorsHeaders(resp)
-                    return resp
                 }
+
+                val resp = newFixedLengthResponse(
+                    Response.Status.OK,
+                    "application/json",
+                    JSONObject().put("status", "accepted").put("action", action).toString(),
+                )
+                addCorsHeaders(resp)
+                return resp
             }
 
             val notFound = newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Not Found")
