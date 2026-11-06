@@ -127,12 +127,10 @@ fun JamScreen(
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
 
-    // High contrast adaptive theme colors: deep rich green in light mode, neon lime in dark mode
-    val isDark = LocalIsDarkTheme.current
-    val jamAccent = if (isDark) Color(0xFFC9FB00) else Color(0xFF2E6B12)
-    val onJamAccent = if (isDark) Color(0xFF012226) else Color.White
-    val jamAccentContainer = if (isDark) Color(0xFFC9FB00).copy(alpha = 0.16f) else Color(0xFF2E6B12).copy(alpha = 0.12f)
-    val onJamAccentContainer = if (isDark) Color(0xFFC9FB00) else Color(0xFF2E6B12)
+    val jamAccent = MaterialTheme.colorScheme.primary
+    val onJamAccent = MaterialTheme.colorScheme.onPrimary
+    val jamAccentContainer = MaterialTheme.colorScheme.primaryContainer
+    val onJamAccentContainer = MaterialTheme.colorScheme.onPrimaryContainer
     val liveGreen = if (isDark) Color(0xFF22C55E) else Color(0xFF16A34A)
 
     var selectedTabIndex by remember { mutableIntStateOf(0) }
