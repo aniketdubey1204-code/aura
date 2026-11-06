@@ -19,6 +19,7 @@ data class SplicePlan(
     val pitchShiftSemitones: Int = 0,
     val requiresPhraseLoop: Boolean = false,
     val loopBarsCount: Int = 0,
+    val tempoRatio: Float = 1.0f,
 )
 
 object SpliceTrajectorySynthesizer {
@@ -44,6 +45,26 @@ object SpliceTrajectorySynthesizer {
         val inDur = incomingDurationMs?.takeIf { it > 0L }
             ?: incomingTrack.durationMs?.takeIf { it > 0L }
             ?: (incomingSignature?.durationMs ?: 180_000L)
+
+        // 1. Same Album Guard (Gapless continuity for concept albums like Apple Music):
+        val outAlbum = outgoingTrack.album?.trim()?.lowercase()
+        val inAlbum = incomingTrack.album?.trim()?.lowercase()
+        val sameAlbum = !isShuffleActive &&
+            !outAlbum.isNullOrBlank() &&
+            !inAlbum.isNullOrBlank() &&
+            outAlbum == inAlbum &&
+            outAlbum != "single" &&
+            outAlbum != "singles"
+        if (sameAlbum) {
+            return SplicePlan(
+                cueOutStartMs = 0L,
+                cueInStartMs = 0L,
+                durationMs = 0L,
+                transitionStyle = TransitionStyle.PERCEPTUAL_FADE,
+                isBypass = true,
+                bypassReason = "Same album gapless continuity",
+            )
+        }
 
         // 2. Short Track Guard:
         // Tracks < 15 seconds are bypassed
@@ -145,6 +166,24 @@ object SpliceTrajectorySynthesizer {
             else -> TransitionStyle.PERCEPTUAL_FADE
         }
 
+        var bestTempoRatio = 1.0f
+        if (outgoingSignature != null && incomingSignature != null) {
+            val outBpm = outgoingSignature.beatGrid.bpm.value
+            val inBpm = incomingSignature.beatGrid.bpm.value
+            if (outBpm > 0f && inBpm > 0f) {
+                var minDiff = Float.MAX_VALUE
+                for (m in floatArrayOf(0.5f, 1.0f, 2.0f)) {
+                    val r = outBpm / (inBpm * m)
+                    if (kotlin.math.abs(r - 1.0f) < kotlin.math.abs(minDiff - 1.0f)) {
+                        minDiff = r
+                    }
+                }
+                if (kotlin.math.abs(minDiff - 1.0f) <= 0.06f) {
+                    bestTempoRatio = minDiff
+                }
+            }
+        }
+
         return SplicePlan(
             cueOutStartMs = cueOutStartMs,
             cueInStartMs = cueInStartMs,
@@ -154,6 +193,7 @@ object SpliceTrajectorySynthesizer {
             pitchShiftSemitones = harmonicMatch?.suggestedPitchShiftSemitones ?: 0,
             requiresPhraseLoop = requiresLoop,
             loopBarsCount = loopBars,
+            tempoRatio = bestTempoRatio,
         )
     }
 }

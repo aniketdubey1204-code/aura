@@ -84,6 +84,7 @@ class DualDeckTransportCoordinator @Inject constructor(
         positionMs: Long,
         durationMs: Long,
         nextTrackStreamUrl: String? = null,
+        isShuffleActive: Boolean = false,
     ) {
         if (!currentSettings.autoMixEnabled || isHardwareBypassEngaged || isJamRoomActive) {
             if (_telemetry.value.phase != BlendPhase.IDLE) {
@@ -141,6 +142,7 @@ class DualDeckTransportCoordinator @Inject constructor(
                         incomingTrack = nextTrack,
                         incomingSignature = sig,
                         settings = currentSettings,
+                        isShuffleActive = isShuffleActive,
                         outgoingDurationMs = durationMs,
                         incomingDurationMs = nextTrack.durationMs,
                     )
@@ -158,8 +160,8 @@ class DualDeckTransportCoordinator @Inject constructor(
                             )
                         }
                     } else {
-                        // Do not drop to IDLE immediately; fallback will arm a safe transition
-                        _telemetry.update { it.copy(phase = BlendPhase.ARMED) }
+                        // Truly bypassed (e.g. same album gapless preservation)
+                        _telemetry.update { it.copy(phase = BlendPhase.IDLE) }
                     }
                 }
             }
@@ -169,7 +171,7 @@ class DualDeckTransportCoordinator @Inject constructor(
         val fallbackDurationMs = (currentSettings.targetDurationSeconds * 1000L).coerceIn(8_000L, 25_000L)
         if (durationMs > 10_000L && remainingMs in 1L..60_000L && remainingMs <= fallbackDurationMs + 5000L && nextTrack != null) {
             val plan = currentSplicePlan
-            if (plan == null || plan.isBypass) {
+            if (plan == null) {
                 val safePlan = SplicePlan(
                     cueOutStartMs = maxOf(0L, durationMs - fallbackDurationMs),
                     cueInStartMs = 0L,
@@ -234,7 +236,8 @@ class DualDeckTransportCoordinator @Inject constructor(
         }
 
         primaryPlayer.setPlaybackSpeed(1.0f)
-        secondaryPlayer.setPlaybackSpeed(1.0f)
+        val targetSpeed = plan.tempoRatio
+        secondaryPlayer.setPlaybackSpeed(targetSpeed)
 
         secondaryPlayer.volume = 0.0f
         secondaryPlayer.seekTo(plan.cueInStartMs)
@@ -250,9 +253,22 @@ class DualDeckTransportCoordinator @Inject constructor(
 
                 _telemetry.update { it.copy(blendProgress = progress) }
 
-                // Equal-power volume curve application with headroom trim
-                val gainOut = kotlin.math.cos(progress * Math.PI * 0.5).toFloat().coerceIn(0.0f, 1.0f)
-                val gainIn = kotlin.math.sin(progress * Math.PI * 0.5).toFloat().coerceIn(0.0f, 1.0f)
+                // DJ-style gains: outgoing holds groove for first 40%, incoming enters over first 60%
+                val isDjMix = plan.transitionStyle == TransitionStyle.HARMONIC_BEATMIX ||
+                    plan.transitionStyle == TransitionStyle.SPECTRAL_SWEEP
+                val (gainOut, gainIn) = if (isDjMix) {
+                    fun smooth(x: Float): Float {
+                        val t = x.coerceIn(0f, 1f)
+                        return t * t * (3f - 2f * t)
+                    }
+                    val gIn = kotlin.math.sin(smooth(progress / 0.6f) * Math.PI * 0.5).toFloat()
+                    val gOut = kotlin.math.cos(smooth((progress - 0.4f) / 0.6f) * Math.PI * 0.5).toFloat()
+                    Pair(gOut, gIn)
+                } else {
+                    val gOut = kotlin.math.cos(progress * Math.PI * 0.5).toFloat().coerceIn(0.0f, 1.0f)
+                    val gIn = kotlin.math.sin(progress * Math.PI * 0.5).toFloat().coerceIn(0.0f, 1.0f)
+                    Pair(gOut, gIn)
+                }
                 val sum = gainIn + gainOut
                 val trim = if (sum <= 1f) 1f else 1f / kotlin.math.sqrt(sum)
                 primaryPlayer.volume = (gainOut * trim * baseVolume).coerceIn(0f, 1f)
@@ -284,6 +300,23 @@ class DualDeckTransportCoordinator @Inject constructor(
             }
 
             runCatching { onTransitionComplete?.invoke() }
+
+            // Smooth tempo glide back to 1.0f over 5 seconds (Apple Music post-mix tempo restoration)
+            val incomingPlayer = secondaryPlayer
+            val fromRate = plan.tempoRatio
+            if (kotlin.math.abs(fromRate - 1.0f) > 0.005f) {
+                scope.launch {
+                    val steps = 50
+                    for (i in 1..steps) {
+                        delay(100L)
+                        val p = i.toFloat() / steps.toFloat()
+                        val s = p * p * (3f - 2f * p)
+                        val currentRate = fromRate + (1.0f - fromRate) * s
+                        runCatching { incomingPlayer.setPlaybackSpeed(currentRate) }
+                    }
+                    runCatching { incomingPlayer.setPlaybackSpeed(1.0f) }
+                }
+            }
 
             // Display MIXED ✓ for 1,500 ms before settling to IDLE
             delay(1_500L)
@@ -336,6 +369,12 @@ class DualDeckTransportCoordinator @Inject constructor(
             currentSplicePlan = null
             currentPrimaryPlayer = null
             currentSecondaryPlayer = null
+        }
+    }
+
+    fun toggleAutoMix() {
+        scope.launch {
+            preferences.setAutoMixEnabled(!currentSettings.autoMixEnabled)
         }
     }
 

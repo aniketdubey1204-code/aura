@@ -944,23 +944,17 @@ fun SettingsScreen(
                         }
                         val hfSettings by viewModel.autoMixSettings.collectAsStateWithLifecycle()
                         add { position ->
-                            SettingsToggleCard(
-                                icon = Icons.Filled.Bolt,
-                                iconContainer = MaterialTheme.colorScheme.primaryContainer,
-                                iconTint = MaterialTheme.colorScheme.onPrimaryContainer,
-                                title = "AutoMix",
-                                subtitle = if (hfSettings.autoMixEnabled) {
-                                    if (hfSettings.durationMode == com.lastwave.app.playback.automix.api.TransitionDurationMode.AUTO) {
-                                        "Active \u2022 Phrase-matched transition (Auto)"
-                                    } else {
-                                        "Active \u2022 Custom DJ blend (${hfSettings.targetDurationSeconds}s)"
-                                    }
-                                } else {
-                                    "Beat-matched, key-locked seamless dual-deck mixing"
+                            SongTransitionsSelectorCard(
+                                autoMixEnabled = hfSettings.autoMixEnabled,
+                                crossfadeEnabled = misc.crossfadeEnabled,
+                                onSelectAutoMix = { viewModel.setAutoMixEnabled(true) },
+                                onSelectCrossfade = { viewModel.setCrossfadeEnabled(true) },
+                                onSelectOff = {
+                                    viewModel.setAutoMixEnabled(false)
+                                    viewModel.setCrossfadeEnabled(false)
                                 },
-                                checked = hfSettings.autoMixEnabled,
-                                onCheckedChange = viewModel::setAutoMixEnabled,
                                 position = position,
+                                isHighlighted = (highlightedSettingId == "audio.crossfade"),
                             )
                         }
                         if (hfSettings.autoMixEnabled) {
@@ -973,27 +967,7 @@ fun SettingsScreen(
                                     position = position,
                                 )
                             }
-                        }
-                        add { position ->
-                            SettingsToggleCard(
-                                icon = Icons.Filled.GraphicEq,
-                                iconContainer = MaterialTheme.colorScheme.secondaryContainer,
-                                iconTint = MaterialTheme.colorScheme.onSecondaryContainer,
-                                title = stringResource(R.string.settings_crossfade),
-                                subtitle = if (misc.crossfadeEnabled && misc.isBitPerfectEnabled) {
-                                    "Paused while Bit-Perfect is enabled"
-                                } else if (misc.crossfadeEnabled) {
-                                    "Smooth transition between tracks \u2022 ${misc.crossfadeSeconds} sec"
-                                } else {
-                                    "Blend the end of a track into the next one"
-                                },
-                                checked = misc.crossfadeEnabled,
-                                onCheckedChange = viewModel::setCrossfadeEnabled,
-                                position = position,
-                                isHighlighted = (highlightedSettingId == "audio.crossfade"),
-                            )
-                        }
-                        if (misc.crossfadeEnabled) {
+                        } else if (misc.crossfadeEnabled) {
                             add { position ->
                                 CrossfadeDurationRow(
                                     seconds = misc.crossfadeSeconds,
@@ -3587,6 +3561,172 @@ private fun SettingsToggleCard(
 }
 
 
+
+@Composable
+private fun SongTransitionsSelectorCard(
+    autoMixEnabled: Boolean,
+    crossfadeEnabled: Boolean,
+    onSelectAutoMix: () -> Unit,
+    onSelectCrossfade: () -> Unit,
+    onSelectOff: () -> Unit,
+    position: GroupPosition = GroupPosition.SINGLE,
+    isHighlighted: Boolean = false,
+) {
+    val haptic = androidx.compose.ui.platform.LocalHapticFeedback.current
+    val shape = groupShape(position)
+
+    val subtitle = when {
+        autoMixEnabled -> "Apple Music style: tempo match, downbeat lock, dynamic bass swap"
+        crossfadeEnabled -> "Gradual equal-power volume blend between songs"
+        else -> "Standard gapless transitions between songs"
+    }
+
+    Card(
+        shape = shape,
+        colors = CardDefaults.cardColors(
+            containerColor = if (isHighlighted) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.25f)
+            else MaterialTheme.colorScheme.surfaceContainerHigh
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 14.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(MaterialTheme.colorScheme.primaryContainer),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.AutoAwesome,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                        modifier = Modifier.size(22.dp),
+                    )
+                }
+                Spacer(Modifier.width(14.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        text = "Song Transitions",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        text = subtitle,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(14.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                val isAutoMix = autoMixEnabled
+                Surface(
+                    onClick = {
+                        if (!isAutoMix) {
+                            haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.TextHandleMove)
+                            onSelectAutoMix()
+                        }
+                    },
+                    shape = RoundedCornerShape(12.dp),
+                    color = if (isAutoMix) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceContainerHighest,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(vertical = 10.dp, horizontal = 6.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        Text(
+                            text = "AutoMix",
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = if (isAutoMix) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface,
+                        )
+                        Text(
+                            text = "Smart DJ",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (isAutoMix) MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.85f) else MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+
+                val isCrossfade = !autoMixEnabled && crossfadeEnabled
+                Surface(
+                    onClick = {
+                        if (!isCrossfade) {
+                            haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.TextHandleMove)
+                            onSelectCrossfade()
+                        }
+                    },
+                    shape = RoundedCornerShape(12.dp),
+                    color = if (isCrossfade) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceContainerHighest,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(vertical = 10.dp, horizontal = 6.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        Text(
+                            text = "Crossfade",
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = if (isCrossfade) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface,
+                        )
+                        Text(
+                            text = "Blend",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (isCrossfade) MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.85f) else MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+
+                val isOff = !autoMixEnabled && !crossfadeEnabled
+                Surface(
+                    onClick = {
+                        if (!isOff) {
+                            haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.TextHandleMove)
+                            onSelectOff()
+                        }
+                    },
+                    shape = RoundedCornerShape(12.dp),
+                    color = if (isOff) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceContainerHighest,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(vertical = 10.dp, horizontal = 6.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        Text(
+                            text = "Off",
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = if (isOff) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface,
+                        )
+                        Text(
+                            text = "Gapless",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (isOff) MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.85f) else MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
 
 @Composable
 private fun CrossfadeDurationRow(

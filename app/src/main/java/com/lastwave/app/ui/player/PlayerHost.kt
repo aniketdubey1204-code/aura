@@ -5825,6 +5825,27 @@ private fun QueuePanel(state: MusicPlayerState, player: MusicPlayer, modifier: M
             Spacer(Modifier.width(8.dp))
             IconButton(
                 onClick = {
+                    player.toggleAutoMix()
+                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                },
+                modifier = Modifier
+                    .size(44.dp)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(
+                        if (state.autoMixEnabled) MaterialTheme.colorScheme.primary.copy(alpha = 0.25f)
+                        else Color.White.copy(alpha = 0.14f)
+                    ),
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.AutoAwesome,
+                    contentDescription = if (state.autoMixEnabled) "AutoMix active" else "AutoMix off",
+                    tint = if (state.autoMixEnabled) MaterialTheme.colorScheme.primary
+                    else Color.White.copy(alpha = 0.90f),
+                )
+            }
+            Spacer(Modifier.width(8.dp))
+            IconButton(
+                onClick = {
                     isQueueLockedState = !isQueueLockedState
                     haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                 },

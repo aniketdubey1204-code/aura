@@ -204,6 +204,7 @@ data class MusicPlayerState(
     val error: String? = null,
     val isJamActive: Boolean = false,
     val deckBlendTelemetry: com.lastwave.app.playback.automix.api.DeckBlendTelemetry = com.lastwave.app.playback.automix.api.DeckBlendTelemetry.IDLE,
+    val autoMixEnabled: Boolean = false,
     val isCrossfading: Boolean = false,
     val appVolume: Float = 1f,
     val isCasting: Boolean = false,
@@ -1797,7 +1798,12 @@ class MusicPlayer @Inject constructor(
     init {
         applicationScope.launch {
             autoMixCoordinator.get().telemetry.collect { tel ->
-                _state.update { it.copy(deckBlendTelemetry = tel) }
+                _state.update {
+                    it.copy(
+                        deckBlendTelemetry = tel,
+                        autoMixEnabled = autoMixCoordinator.get().isEnabled,
+                    )
+                }
             }
         }
         val autoMixCoord = autoMixCoordinator.get()
@@ -1960,6 +1966,7 @@ class MusicPlayer @Inject constructor(
                                 positionMs = pos,
                                 durationMs = dur,
                                 nextTrackStreamUrl = nextStreamUrl,
+                                isShuffleActive = _state.value.shuffleEnabled,
                             )
                             val autoMixActive = autoMixCoordinator.get().isEnabled &&
                                 (_state.value.deckBlendTelemetry.isArmedOrBlending ||
@@ -4770,6 +4777,11 @@ class MusicPlayer @Inject constructor(
         val block = startupFollowUp ?: return
         startupFollowUp = null
         block()
+    }
+
+    fun toggleAutoMix() = onMain {
+        autoMixCoordinator.get().toggleAutoMix()
+        _state.update { it.copy(autoMixEnabled = autoMixCoordinator.get().isEnabled) }
     }
 
     fun toggleShuffle() = setShuffleEnabled(!state.value.shuffleEnabled)
