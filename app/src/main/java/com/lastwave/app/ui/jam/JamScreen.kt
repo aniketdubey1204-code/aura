@@ -127,6 +127,7 @@ fun JamScreen(
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
 
+    val isDark = LocalIsDarkTheme.current
     val jamAccent = MaterialTheme.colorScheme.primary
     val onJamAccent = MaterialTheme.colorScheme.onPrimary
     val jamAccentContainer = MaterialTheme.colorScheme.primaryContainer
