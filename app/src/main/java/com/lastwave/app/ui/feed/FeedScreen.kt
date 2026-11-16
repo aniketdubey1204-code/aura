@@ -517,7 +517,11 @@ fun FeedScreen(
                 }
                 val combinedQuickPicks = remember(state.feedData.quickPicks, ytQuickPicksShelf) {
                     val fromYt = ytQuickPicksShelf?.items?.filterIsInstance<HomeShelfItem.Track>()?.map { it.track }.orEmpty()
-                    (state.feedData.quickPicks + fromYt).distinctBy { it.videoId.ifBlank { it.title } }
+                    if (fromYt.isNotEmpty()) {
+                        fromYt
+                    } else {
+                        state.feedData.quickPicks
+                    }
                 }
 
                 val remainingNativeShelves = remember(state.feedData.nativeShelves, ytNewReleasesShelf, ytQuickPicksShelf, allHiddenIds, ytHidden) {

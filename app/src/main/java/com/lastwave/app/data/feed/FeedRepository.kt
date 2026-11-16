@@ -376,11 +376,15 @@ class FeedRepository @Inject constructor(
         // emission — the related-songs round-trips (3 x up to 30 tracks) are
         // the slowest calls in the load, and waiting on them left the whole
         // feed blank for seconds on a cold start.
-        val familiarQuickPicks = diversify(familiarCandidates, YouTubeMusicTrack::artist, maxPerArtist = 2)
-            .take(18)
-            .ifEmpty { charts }
-            .distinctBy { it.artist.trim().lowercase() to it.title.trim().lowercase() }
-            .take(15)
+        val familiarQuickPicks = if (isYtConnected && ytQuickPicks.isNotEmpty()) {
+            ytQuickPicks.distinctBy { it.artist.trim().lowercase() to it.title.trim().lowercase() }.take(18)
+        } else {
+            diversify(familiarCandidates, YouTubeMusicTrack::artist, maxPerArtist = 2)
+                .take(18)
+                .ifEmpty { charts }
+                .distinctBy { it.artist.trim().lowercase() to it.title.trim().lowercase() }
+                .take(15)
+        }
         onUpdate(shelf(familiarQuickPicks))
 
         // Discovery: blends fresh picks over the familiar ones once the
@@ -416,11 +420,15 @@ class FeedRepository @Inject constructor(
             second = diversify(freshOrChart, YouTubeMusicTrack::artist, maxPerArtist = 1),
         )
 
-        val quickPicks = diversify(quickCandidates, YouTubeMusicTrack::artist, maxPerArtist = 2)
-            .take(18)
-            .ifEmpty { charts }
-            .distinctBy { it.artist.trim().lowercase() to it.title.trim().lowercase() }
-            .take(15)
+        val quickPicks = if (isYtConnected && ytQuickPicks.isNotEmpty()) {
+            ytQuickPicks.distinctBy { it.artist.trim().lowercase() to it.title.trim().lowercase() }.take(18)
+        } else {
+            diversify(quickCandidates, YouTubeMusicTrack::artist, maxPerArtist = 2)
+                .take(18)
+                .ifEmpty { charts }
+                .distinctBy { it.artist.trim().lowercase() to it.title.trim().lowercase() }
+                .take(15)
+        }
 
         onUpdate(shelf(quickPicks))
 

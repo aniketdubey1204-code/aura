@@ -2098,19 +2098,32 @@ class InnerTubeMusicApi @Inject constructor(
         }
     }
 
-    /** Anonymous YouTube Music radio for a seed video. This intentionally
-     * stays cookie-free so related-song playlists work without an account. */
+    /** YouTube Music related-songs expansion. Authenticated when account connected,
+     * so user personalization and taste profile are respected. */
     suspend fun fetchRelatedSongs(
         videoId: String,
         limit: Int = 30,
         prefetchStreams: Boolean = false,
+    ): List<YouTubeMusicTrack> = fetchRelatedSongs(
+        videoId = videoId,
+        limit = limit,
+        prefetchStreams = prefetchStreams,
+        authenticated = true,
+    )
+
+    suspend fun fetchRelatedSongs(
+        videoId: String,
+        limit: Int,
+        prefetchStreams: Boolean,
+        authenticated: Boolean,
     ): List<YouTubeMusicTrack> = withContext(Dispatchers.IO) {
         if (videoId.isBlank() || limit <= 0) return@withContext emptyList()
         val config = getWebConfig()
+        val isAuth = authenticated && ytAuth.connection.value.isConnected
         val root = post(
             url = "$MUSIC_API/next?key=${config.apiKey}&prettyPrint=false",
             body = buildJsonObject {
-                put("context", context("WEB_REMIX", config.clientVersion, config.visitorData))
+                put("context", context("WEB_REMIX", config.clientVersion, config.visitorData, authenticated = isAuth))
                 put("videoId", videoId)
                 put("playlistId", "RDAMVM$videoId")
                 put("params", "wAEB")
@@ -2119,6 +2132,7 @@ class InnerTubeMusicApi @Inject constructor(
             clientName = "WEB_REMIX",
             clientVersion = config.clientVersion,
             userAgent = WEB_USER_AGENT,
+            authenticated = isAuth,
             callTimeoutMs = RELATED_REQUEST_TIMEOUT_MS,
         )
         val results = parseSongRenderers(root)
@@ -2146,7 +2160,11 @@ class InnerTubeMusicApi @Inject constructor(
                 put("context", context("WEB_REMIX", config.clientVersion, config.visitorData, authenticated = isAuth))
                 put("videoId", videoId)
                 put("playlistId", "RDAMVM$videoId")
-                put("params", params)
+                if (params.isNotBlank() && params != "wAEB") {
+                    put("params", params)
+                } else if (!isAuth) {
+                    put("params", "wAEB")
+                }
                 put("isAudioOnly", true)
             },
             clientName = "WEB_REMIX",
