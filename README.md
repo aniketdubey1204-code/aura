@@ -7,6 +7,12 @@
 **Next-generation Android music client powered by YouTube Music, synchronized lyrics, universal scrobbling, and hardware-accelerated Liquid Glass.**
 
 <p align="center">
+  <a href="https://aura.aniketdubey.me">
+    <img src="https://img.shields.io/badge/Official_Website-aura.aniketdubey.me-266DF9?style=for-the-badge&logo=googlechrome&logoColor=white&labelColor=23272e" alt="Official Website" />
+  </a>
+  <a href="https://github.com/aniketdubey1204-code/aura/stargazers">
+    <img src="https://img.shields.io/github/stars/aniketdubey1204-code/aura?style=for-the-badge&color=ffbc95&labelColor=23272e" alt="GitHub Stars" />
+  </a>
   <img src="https://img.shields.io/badge/Platform-Android%2010+-3DDC84?style=for-the-badge&logo=android&logoColor=white&labelColor=23272e" alt="Platform" />
   <img src="https://img.shields.io/badge/UI-Jetpack%20Compose-4285F4?style=for-the-badge&logo=jetpackcompose&logoColor=white&labelColor=23272e" alt="Jetpack Compose" />
   <img src="https://img.shields.io/badge/Style-Material%203%20Expressive-6750A4?style=for-the-badge&logo=materialdesign&logoColor=white&labelColor=23272e" alt="Material 3" />
@@ -27,6 +33,9 @@
   <img src="Screenshot/screenshot_5.png" width="31%" style="border-radius: 14px; margin: 4px;" alt="Stats" />
   <img src="Screenshot/screenshot_6.png" width="31%" style="border-radius: 14px; margin: 4px;" alt="Settings" />
 </div>
+
+> [!TIP]
+> **Enjoying Aura?** Give this repository a ⭐ star to support development and help more listeners discover bit-perfect open source music on Android. Download recurring releases, explore features, and get the desktop client at [aura.aniketdubey.me](https://aura.aniketdubey.me).
 
 ---
 
