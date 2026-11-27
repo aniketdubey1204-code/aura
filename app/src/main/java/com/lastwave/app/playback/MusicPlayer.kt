@@ -1822,9 +1822,12 @@ class MusicPlayer @Inject constructor(
                     }
                 }
             }
-            incoming.shuffleModeEnabled = outgoing.shuffleModeEnabled
-            incoming.repeatMode = outgoing.repeatMode
-            incoming.playbackParameters = outgoing.playbackParameters
+            if (incoming.shuffleModeEnabled != outgoing.shuffleModeEnabled) {
+                incoming.shuffleModeEnabled = outgoing.shuffleModeEnabled
+            }
+            if (incoming.repeatMode != outgoing.repeatMode) {
+                incoming.repeatMode = outgoing.repeatMode
+            }
             crossfadeStandbyArmed = false
             crossfadeStandbyPreparing = false
             outgoingPlayer = outgoing
@@ -1833,8 +1836,9 @@ class MusicPlayer @Inject constructor(
             outgoing.repeatMode = Player.REPEAT_MODE_OFF
             outgoing.shuffleModeEnabled = false
             incoming.addListener(listener)
-            incoming.setAudioAttributes(incoming.audioAttributes, false)
-            incoming.play()
+            if (!incoming.playWhenReady) {
+                incoming.play()
+            }
             listener.onMediaItemTransition(incoming.currentMediaItem, Player.MEDIA_ITEM_TRANSITION_REASON_AUTO)
             refresh(incoming)
         }
@@ -3300,6 +3304,7 @@ class MusicPlayer @Inject constructor(
 
     @MainThread
     private fun cancelCrossfade() {
+        autoMixCoordinator.get().cancelTransition(revertToPrimary = false)
         crossfadeStandbyArmed = false
         crossfadeStandbyPreparing = false
         lastCrossfadeLogKey = null
@@ -3309,12 +3314,13 @@ class MusicPlayer @Inject constructor(
         outgoingPlayer = null
         outgoingToStop?.stop()
         outgoingToStop?.clearMediaItems()
-        if (!autoMixCoordinator.get().isEnabled) {
-            val standby = if (player === secondaryPlayer) playerDelegate.value else secondaryPlayer
-            standby?.stop()
-            standby?.clearMediaItems()
-            standbyQueue = emptyList()
-            standbyIndex = C.INDEX_UNSET
+        val standby = if (player === secondaryPlayer) playerDelegate.value else secondaryPlayer
+        standby?.stop()
+        standby?.clearMediaItems()
+        standbyQueue = emptyList()
+        standbyIndex = C.INDEX_UNSET
+        if (kotlin.math.abs(player.playbackParameters.speed - 1.0f) > 0.001f) {
+            player.setPlaybackSpeed(1.0f)
         }
         player.volume = if (bitPerfectEnabled) 1f else appVolume
     }
@@ -6948,9 +6954,9 @@ class MusicPlayer @Inject constructor(
             }
         }
 
-        // 2. 5-second lossless window for first/interactive track. Recovery
-        // paths pass LosslessBudget.Disabled so the module chain never delays
-        // the stream that has to replace a dead one.
+        // 2. Fast interactive resolution: never block 5s on lossless before
+        // checking cache or starting YouTube. Race them in parallel so clicks
+        // start playing immediately while lossless hot-swaps if slower.
         val misc = runCatching { settingsPreferences.settings.first() }.getOrDefault(MiscSettings())
         val wantLossless = allowLossless &&
             misc.preferLosslessStreaming &&
@@ -6958,13 +6964,12 @@ class MusicPlayer @Inject constructor(
             !losslessMusicApi.isCoolingDown &&
             losslessBudget != LosslessBudget.Disabled
 
-        if (wantLossless) {
+        PlaybackStartupLog.cacheLookupStart()
+        val cached = identity?.let { streamResolver.cache.get(it) }?.takeIf { it.matches(identity) }
+        PlaybackStartupLog.cacheLookupEnd(hit = cached != null)
+
+        if (wantLossless && losslessBudget == LosslessBudget.Unbounded) {
             val expectedSec = (track.durationMs?.takeIf { it > 0 })?.div(1_000)?.toInt()
-            val timeoutMs = when (losslessBudget) {
-                LosslessBudget.Interactive -> 5_000L
-                LosslessBudget.Unbounded -> 10_000L
-                LosslessBudget.Disabled -> 0L
-            }
             val deferred = applicationScope.async(Dispatchers.IO) {
                 runCatching {
                     resolveLosslessTrackAudioStream(
@@ -6978,7 +6983,7 @@ class MusicPlayer @Inject constructor(
             activeUpgradeDeferred = deferred
 
             val losslessStream = runCatching {
-                withTimeoutOrNull(timeoutMs) {
+                withTimeoutOrNull(10_000L) {
                     deferred.await()
                 }
             }.getOrNull()
@@ -6992,15 +6997,95 @@ class MusicPlayer @Inject constructor(
                 )
                 return losslessStream
             }
-            android.util.Log.i(
-                "MusicPlayer",
-                "[STARTUP RESOLVE] Lossless startup resolution exceeded ${timeoutMs}ms for '${track.title}', falling back to YouTube while continuing lossless search in background for hot-swap",
-            )
         }
 
-        PlaybackStartupLog.cacheLookupStart()
-        val cached = identity?.let { streamResolver.cache.get(it) }?.takeIf { it.matches(identity) }
-        PlaybackStartupLog.cacheLookupEnd(hit = cached != null)
+        if (wantLossless && losslessBudget == LosslessBudget.Interactive) {
+            val expectedSec = (track.durationMs?.takeIf { it > 0 })?.div(1_000)?.toInt()
+            val losslessDeferred = applicationScope.async(Dispatchers.IO) {
+                runCatching {
+                    resolveLosslessTrackAudioStream(
+                        track = track,
+                        misc = misc,
+                        excludedLosslessUrls = excludedLosslessUrls,
+                        expectedDurationSeconds = expectedSec,
+                    )
+                }.getOrNull()
+            }
+            activeUpgradeDeferred = losslessDeferred
+
+            if (cached != null && identity != null) {
+                val fastLossless = runCatching {
+                    withTimeoutOrNull(350L) { losslessDeferred.await() }
+                }.getOrNull()
+                if (fastLossless != null) {
+                    activeUpgradeDeferred = null
+                    registerPreparedStream(fastLossless)
+                    return fastLossless
+                }
+                if (claimPlayback) {
+                    streamResolver.playback.begin(identity)
+                }
+                return acceptResolvedIdentity(track, identity, cached, claimPlayback = claimPlayback)
+            }
+
+            return coroutineScope {
+                val localQuick = async(Dispatchers.IO) {
+                    if (!allowLocalDownloads) null
+                    else runCatching { resolveLocalDownloadedAudioStream(track, deepScan = true) }.getOrNull()
+                }
+                val youtube = async(Dispatchers.IO) {
+                    resolveYoutubeTrackAudioStream(track, videoId, claimPlayback = claimPlayback)
+                }
+                val startMs = SystemClock.elapsedRealtime()
+                while (true) {
+                    ensureActive()
+                    if (losslessDeferred.isCompleted) {
+                        val losslessStream = runCatching { losslessDeferred.await() }.getOrNull()
+                        if (losslessStream != null) {
+                            localQuick.cancel()
+                            youtube.cancel()
+                            activeUpgradeDeferred = null
+                            registerPreparedStream(losslessStream)
+                            return@coroutineScope losslessStream
+                        }
+                    }
+                    if (localQuick.isCompleted) {
+                        val local = localQuick.await()
+                        if (local != null) {
+                            youtube.cancel()
+                            return@coroutineScope local
+                        }
+                    }
+                    if (youtube.isCompleted) {
+                        localQuick.cancel()
+                        val ytStream = youtube.await()
+                        val elapsed = SystemClock.elapsedRealtime() - startMs
+                        val remainingGrace = (1_500L - elapsed).coerceIn(0L, 400L)
+                        if (remainingGrace > 0L && !losslessDeferred.isCompleted) {
+                            val quickLossless = runCatching {
+                                withTimeoutOrNull(remainingGrace) { losslessDeferred.await() }
+                            }.getOrNull()
+                            if (quickLossless != null) {
+                                activeUpgradeDeferred = null
+                                registerPreparedStream(quickLossless)
+                                return@coroutineScope quickLossless
+                            }
+                        } else if (losslessDeferred.isCompleted) {
+                            val quickLossless = runCatching { losslessDeferred.await() }.getOrNull()
+                            if (quickLossless != null) {
+                                activeUpgradeDeferred = null
+                                registerPreparedStream(quickLossless)
+                                return@coroutineScope quickLossless
+                            }
+                        }
+                        return@coroutineScope ytStream
+                    }
+                    delay(10)
+                }
+                error("Playback resolve race ended unexpectedly")
+            }
+        }
+
         if (cached != null && identity != null) {
             if (claimPlayback) {
                 streamResolver.playback.begin(identity)

@@ -57,6 +57,8 @@ class DualDeckTransportCoordinator @Inject constructor(
 
     private var activeTrackKey: String? = null
     private var activeSpliceJob: Job? = null
+    private var tempoGlideJob: Job? = null
+    private var postMixResetJob: Job? = null
     private var currentSplicePlan: SplicePlan? = null
     private var currentPrimaryPlayer: ExoPlayer? = null
     private var currentSecondaryPlayer: ExoPlayer? = null
@@ -191,8 +193,20 @@ class DualDeckTransportCoordinator @Inject constructor(
             }
         }
 
-        // 3. Trigger Splice at Splice Horizon
+        // 3. Pre-cue standby deck while ARMED so decoder is primed before splice horizon
         val plan = currentSplicePlan
+        if (plan != null && !plan.isBypass && secondaryPlayer != null && !secondaryPlayer.isPlaying &&
+            secondaryPlayer.playbackState == Player.STATE_READY
+        ) {
+            if (plan.cueInStartMs > 0L && kotlin.math.abs(secondaryPlayer.currentPosition - plan.cueInStartMs) > 150L) {
+                secondaryPlayer.seekTo(plan.cueInStartMs)
+            }
+            if (kotlin.math.abs(secondaryPlayer.playbackParameters.speed - plan.tempoRatio) > 0.001f) {
+                secondaryPlayer.setPlaybackSpeed(plan.tempoRatio)
+            }
+        }
+
+        // 4. Trigger Splice at Splice Horizon
         if (plan != null && !plan.isBypass && (_telemetry.value.phase == BlendPhase.ARMED || _telemetry.value.phase == BlendPhase.PRE_ANALYZING || _telemetry.value.phase == BlendPhase.IDLE)) {
             val effectiveCueOut = if (durationMs > 40_000L && plan.cueOutStartMs < durationMs - 40_000L) {
                 maxOf(0L, durationMs - plan.durationMs).coerceAtLeast(durationMs - 40_000L)
@@ -206,7 +220,7 @@ class DualDeckTransportCoordinator @Inject constructor(
                     secondaryPlayer.prepare()
                 }
                 val isSecondaryReady = secondaryPlayer.playbackState == Player.STATE_READY ||
-                    (secondaryPlayer.playbackState == Player.STATE_BUFFERING && secondaryPlayer.playerError == null)
+                    (remainingMs <= 1_500L && secondaryPlayer.playbackState == Player.STATE_BUFFERING && secondaryPlayer.playerError == null)
                 if (isSecondaryReady) {
                     startBlendExecution(primaryPlayer, secondaryPlayer, plan.copy(cueOutStartMs = effectiveCueOut))
                 }
@@ -220,6 +234,10 @@ class DualDeckTransportCoordinator @Inject constructor(
         plan: SplicePlan,
     ) {
         activeSpliceJob?.cancel()
+        tempoGlideJob?.cancel()
+        tempoGlideJob = null
+        postMixResetJob?.cancel()
+        postMixResetJob = null
         currentPrimaryPlayer = primaryPlayer
         currentSecondaryPlayer = secondaryPlayer
         val durationMs = plan.durationMs.coerceAtLeast(1000L)
@@ -235,12 +253,18 @@ class DualDeckTransportCoordinator @Inject constructor(
             )
         }
 
-        primaryPlayer.setPlaybackSpeed(1.0f)
+        if (kotlin.math.abs(primaryPlayer.playbackParameters.speed - 1.0f) > 0.001f) {
+            primaryPlayer.setPlaybackSpeed(1.0f)
+        }
         val targetSpeed = plan.tempoRatio
-        secondaryPlayer.setPlaybackSpeed(targetSpeed)
+        if (kotlin.math.abs(secondaryPlayer.playbackParameters.speed - targetSpeed) > 0.001f) {
+            secondaryPlayer.setPlaybackSpeed(targetSpeed)
+        }
 
         secondaryPlayer.volume = 0.0f
-        secondaryPlayer.seekTo(plan.cueInStartMs)
+        if (kotlin.math.abs(secondaryPlayer.currentPosition - plan.cueInStartMs) > 150L) {
+            secondaryPlayer.seekTo(plan.cueInStartMs)
+        }
         secondaryPlayer.play()
 
         activeSpliceJob = scope.launch {
@@ -305,7 +329,7 @@ class DualDeckTransportCoordinator @Inject constructor(
             val incomingPlayer = secondaryPlayer
             val fromRate = plan.tempoRatio
             if (kotlin.math.abs(fromRate - 1.0f) > 0.005f) {
-                scope.launch {
+                tempoGlideJob = scope.launch {
                     val steps = 50
                     for (i in 1..steps) {
                         delay(100L)
@@ -330,6 +354,10 @@ class DualDeckTransportCoordinator @Inject constructor(
     override fun cancelTransition(revertToPrimary: Boolean) {
         activeSpliceJob?.cancel()
         activeSpliceJob = null
+        tempoGlideJob?.cancel()
+        tempoGlideJob = null
+        postMixResetJob?.cancel()
+        postMixResetJob = null
         currentSplicePlan = null
         _telemetry.update { DeckBlendTelemetry.IDLE }
         if (revertToPrimary) {
