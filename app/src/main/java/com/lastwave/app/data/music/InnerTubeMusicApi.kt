@@ -64,6 +64,9 @@ import kotlin.random.Random
 import javax.inject.Inject
 import javax.inject.Singleton
 
+@Volatile
+internal var innerTubeDiskCacheDir: File? = null
+
 @androidx.compose.runtime.Immutable
 data class YouTubeMusicTrack(
     val videoId: String,
@@ -1732,7 +1735,7 @@ class InnerTubeMusicApi @Inject constructor(
         }
 
     fun loadCachedHomePageSnapshot(): HomePage? {
-        val dir = diskCacheDir ?: return null
+        val dir = innerTubeDiskCacheDir ?: return null
         val scopeHash = playbackAuthScope().hashCode()
         val file = File(dir, "yt_home_$scopeHash.json")
         if (!file.exists()) return null
@@ -1750,7 +1753,7 @@ class InnerTubeMusicApi @Inject constructor(
     }
 
     private fun saveHomeSnapshotToDisk(scopeHash: Int, root: JsonObject) {
-        val dir = diskCacheDir ?: return
+        val dir = innerTubeDiskCacheDir ?: return
         runCatching {
             val file = File(dir, "yt_home_$scopeHash.json")
             file.writeText(root.toString())
@@ -5376,8 +5379,6 @@ class InnerTubeMusicApi @Inject constructor(
         /** Per-client bound for the direct-URL fast path (single POST, no
          *  extras). Relaxed for slow devices: a fast first success still
          *  wins the race, only the worst case waits longer. */
-        @Volatile
-        var diskCacheDir: File? = null
         const val BROWSE_COALESCE_TTL_MS = 6_000L
         const val BROWSE_CACHE_PRUNE_MS = 30_000L
         const val DIRECT_FAST_CLIENT_TIMEOUT_MS = 2_500L

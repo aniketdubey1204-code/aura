@@ -63,7 +63,7 @@ class AuraApplication : Application(), ImageLoaderFactory {
         // On-demand lyric translation/romanization keeps its bounded result
         // cache under the app cache directory so Android may reclaim it.
         runCatching { com.lastwave.app.data.lyrics.LyricsTranslation.cacheDir = cacheDir }
-        runCatching { com.lastwave.app.data.music.InnerTubeMusicApi.diskCacheDir = cacheDir }
+        runCatching { com.lastwave.app.data.music.innerTubeDiskCacheDir = cacheDir }
         // First-song OPUS warmup: visitorData + NewPipe + BotGuard warm in
         // parallel so first tap never waits behind sequential init.
         applicationScope.launch(Dispatchers.IO) {
