@@ -60,8 +60,8 @@ android {
         applicationId = "com.lastwave.app"
         minSdk = (project.findProperty("minSdk") as? String)?.toIntOrNull() ?: 29
         targetSdk = 35
-        versionCode = 41
-        versionName = "1.0.9"
+        versionCode = 42
+        versionName = "1.0.10"
 
         (project.findProperty("targetAbis") as? String)?.let { prop ->
             ndk {

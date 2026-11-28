@@ -72,12 +72,25 @@ import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import com.kyant.backdrop.drawBackdrop
 import com.kyant.backdrop.effects.blur
 import com.kyant.backdrop.effects.colorControls
-import com.kyant.backdrop.effects.lens
 import com.kyant.backdrop.highlight.Highlight
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
-import kotlin.math.sign
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.shape.AbsoluteRoundedCornerShape
+import androidx.compose.ui.graphics.drawOutline
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.DpOffset
+import com.kyant.backdrop.effects.runtimeShaderEffect
+import com.kyant.backdrop.highlight.HighlightStyle
+import com.kyant.backdrop.shadow.Shadow
+import com.kyant.shapes.RoundedRectangularShape
+import kotlin.math.PI
+import kotlin.math.max
+import kotlin.math.pow
+import kotlin.math.sin
 import com.kyant.backdrop.backdrops.layerBackdrop as nativeBackdrop
 
 /** Shared opt-in flag for Settings > Experimental > Liquid Glass. */
@@ -356,10 +369,10 @@ fun LiquidGlassSurface(
     }
 }
 
-// ── Interactive liquid glass core ──────────────────────────────────────────────
-// No custom RuntimeShader, no ambient infiniteTransition, no haptics,
-// no progressive blur, no always-on chromatic aberration.
-// Effect stack is drawInteractiveGlass.
+// ── Interactive liquid glass core (C1-dome optical system) ───────────────────────
+// Matches the transparent crystal optics, C1-entry SDF dome slope, chromatic
+// R/G/B dispersion, meniscus rim, and droplet press physics from the reference
+// Liquid Glass implementation.
 
 @Composable
 fun isDeviceGlassCapable(): Boolean {
@@ -388,33 +401,236 @@ fun Modifier.liquidGlassSource(
     return this.layerBackdrop(backdrop)
 }
 
+/**
+ * Returns [Color.Transparent] whenever backdrop refraction is active so resting
+ * controls carry zero milky white wash (`background: transparent`).
+ */
 @Composable
 fun liquidGlassContainerColor(
     color: Color,
     enabled: Boolean = LocalLiquidGlass.current,
     backdrop: Backdrop? = LocalLiquidGlassBackdrop.current,
 ): Color = if (enabled && isLiquidGlassBackdropSupported() && backdrop != null) {
-    if (color.isSpecified && color.alpha < 0.95f) color else Color.Transparent
+    Color.Transparent
 } else color
 
 @Composable
 fun isLiquidGlassEnabled(): Boolean = LocalLiquidGlass.current
 
 /**
+ * C1-continuous entry dome slope matching `domeSlopeAt(distIn, bw, curvature)`
+ * so edge normals ramp smoothly from 0 across the outer 14% of the bezel and
+ * eliminate Skia jagged pixelation at curved edges.
+ */
+internal fun domeSlopeAt(s: Float, curvature: Float): Float {
+    if (s <= 0f || s >= 1f) return 0f
+    val entry = if (s < 0.14f) s / 0.14f else 1f
+    val smoothEntry = entry * entry * (3f - 2f * entry)
+    val oneMinusS = (1f - s).coerceAtLeast(0f)
+    val dome = oneMinusS.toDouble().pow((curvature - 1f).toDouble()).toFloat() *
+        sin(oneMinusS.toDouble() * PI * 0.5).toFloat()
+    return smoothEntry * dome
+}
+
+internal fun computeMaxDomeSlope(curvature: Float, samples: Int = 256): Float {
+    var peak = 1e-4f
+    for (i in 1 until samples) {
+        val slope = domeSlopeAt(i.toFloat() / samples.toFloat(), curvature)
+        if (slope > peak) peak = slope
+    }
+    return peak
+}
+
+/**
+ * Optical parameter bundle for a Liquid Glass surface.
+ */
+data class LiquidGlassOptics(
+    val refractionDp: Float,
+    val bezel: Float,
+    val curvature: Float,
+    val chroma: Float,
+    val blurDp: Float = 4f,
+    val saturation: Float = 1.6f,
+    val brightness: Float = 0f,
+    val maxSlope: Float = computeMaxDomeSlope(curvature),
+) {
+    companion object {
+        /** Floating pills, controls, mini-player, and FAB-sized capsules (~56dp). */
+        val Floating = LiquidGlassOptics(
+            refractionDp = 20f,
+            bezel = 0.65f,
+            curvature = 2.6f,
+            chroma = 0.28f,
+            blurDp = 4f,
+            saturation = 1.6f,
+            brightness = 0f,
+        )
+
+        /** Compact navbar pills, bottom dock, and header chrome (~36-48dp). */
+        val NavPill = LiquidGlassOptics(
+            refractionDp = 11f,
+            bezel = 0.62f,
+            curvature = 2.6f,
+            chroma = 0.24f,
+            blurDp = 4f,
+            saturation = 1.6f,
+            brightness = 0f,
+        )
+    }
+}
+
+private const val C1_DOME_REFRACTION_SHADER_KEY = "AuraC1DomeRefractionChromaV1"
+
+private const val C1_DOME_REFRACTION_SHADER = """
+uniform shader content;
+
+uniform float2 size;
+uniform float2 offset;
+uniform float4 cornerRadii;
+uniform float bezel;
+uniform float curvature;
+uniform float refractionAmount;
+uniform float chroma;
+uniform float maxSlope;
+
+float radiusAt(float2 coord, float4 radii) {
+    if (coord.x >= 0.0) {
+        if (coord.y <= 0.0) return radii.y;
+        else return radii.z;
+    } else {
+        if (coord.y <= 0.0) return radii.x;
+        else return radii.w;
+    }
+}
+
+float sdRoundedRect(float2 coord, float2 halfSize, float radius) {
+    float2 cornerCoord = abs(coord) - (halfSize - float2(radius));
+    float outside = length(max(cornerCoord, 0.0)) - radius;
+    float inside = min(max(cornerCoord.x, cornerCoord.y), 0.0);
+    return outside + inside;
+}
+
+float2 gradSdRoundedRect(float2 coord, float2 halfSize, float radius) {
+    float2 cornerCoord = abs(coord) - (halfSize - float2(radius));
+    if (cornerCoord.x >= 0.0 || cornerCoord.y >= 0.0) {
+        float2 clamped = max(cornerCoord, 0.0);
+        float len = length(clamped);
+        if (len < 1e-5) {
+            return sign(coord) * (cornerCoord.x >= cornerCoord.y ? float2(1.0, 0.0) : float2(0.0, 1.0));
+        }
+        return sign(coord) * (clamped / len);
+    } else {
+        float gradX = step(cornerCoord.y, cornerCoord.x);
+        return sign(coord) * float2(gradX, 1.0 - gradX);
+    }
+}
+
+float domeSlopeAt(float s, float curv) {
+    float entry = s < 0.14 ? (s / 0.14) : 1.0;
+    float smoothEntry = entry * entry * (3.0 - 2.0 * entry);
+    float oneMinusS = max(0.0, 1.0 - s);
+    float dome = oneMinusS > 1e-5 ? pow(oneMinusS, max(0.0, curv - 1.0)) * sin(oneMinusS * 1.5707963) : 0.0;
+    return smoothEntry * dome;
+}
+
+half4 main(float2 coord) {
+    float2 halfSize = size * 0.5;
+    if (halfSize.x <= 0.0 || halfSize.y <= 0.0) {
+        return content.eval(coord);
+    }
+    float2 centeredCoord = (coord + offset) - halfSize;
+    float minHalf = min(halfSize.x, halfSize.y);
+    float cornerR = min(radiusAt(centeredCoord, cornerRadii), minHalf);
+    float sd = sdRoundedRect(centeredCoord, halfSize, cornerR);
+    if (sd >= 0.0) {
+        return content.eval(coord);
+    }
+
+    float effectiveR = cornerR > 0.5 ? cornerR : (minHalf * 0.45);
+    float bw = max(4.0, bezel * effectiveR);
+    float distIn = -sd;
+    if (distIn >= bw) {
+        return content.eval(coord);
+    }
+
+    float s = clamp(distIn / bw, 0.0, 1.0);
+    float slopeNorm = clamp(domeSlopeAt(s, curvature) / max(maxSlope, 1e-4), 0.0, 1.0);
+    float gradRadius = min(max(cornerR, bw * 1.02), minHalf);
+    float2 grad = gradSdRoundedRect(centeredCoord, halfSize, gradRadius);
+
+    float safeRefract = min(refractionAmount, bw * 0.90);
+    float baseD = -safeRefract * slopeNorm;
+
+    float2 uvR = coord + grad * baseD;
+    float2 uvG = coord + grad * (baseD * (1.0 + chroma * 0.5));
+    float2 uvB = coord + grad * (baseD * (1.0 + chroma));
+
+    half4 cR = content.eval(uvR);
+    half4 cG = content.eval(uvG);
+    half4 cB = content.eval(uvB);
+
+    half a = clamp(max(cG.a, max(cR.a, cB.a)), 0.0, 1.0);
+    return half4(min(cR.r, a), min(cG.g, a), min(cB.b, a), a);
+}
+"""
+
+internal fun resolveCornerRadiiPx(
+    shape: Shape,
+    size: Size,
+    layoutDirection: LayoutDirection,
+    density: Density,
+): FloatArray {
+    val maxRadius = (size.minDimension / 2f).coerceAtLeast(0f)
+    if (maxRadius <= 0f) return floatArrayOf(0f, 0f, 0f, 0f)
+    val raw = when (shape) {
+        is RoundedRectangularShape -> {
+            val c = shape.corners(size, layoutDirection, density)
+            floatArrayOf(c.topLeft, c.topRight, c.bottomRight, c.bottomLeft)
+        }
+        is AbsoluteRoundedCornerShape -> floatArrayOf(
+            shape.topStart.toPx(size, density),
+            shape.topEnd.toPx(size, density),
+            shape.bottomEnd.toPx(size, density),
+            shape.bottomStart.toPx(size, density),
+        )
+        is CornerBasedShape -> {
+            val ts = shape.topStart.toPx(size, density)
+            val te = shape.topEnd.toPx(size, density)
+            val be = shape.bottomEnd.toPx(size, density)
+            val bs = shape.bottomStart.toPx(size, density)
+            if (layoutDirection == LayoutDirection.Ltr) {
+                floatArrayOf(ts, te, be, bs)
+            } else {
+                floatArrayOf(te, ts, bs, be)
+            }
+        }
+        else -> floatArrayOf(0f, 0f, 0f, 0f)
+    }
+    return FloatArray(4) { i -> raw[i].coerceIn(0f, maxRadius) }
+}
+
+/**
  * Press/hold state holder for a single liquid-glass surface.
- * Responsive GlassInteraction: spring press 0→1,
- * observe-only drag so wrapped clicks keep working.
+ * Snappy 120ms cubic-bezier active droplet compress, spring release back to rest.
  */
 class GlassInteraction(
     private val animationScope: CoroutineScope,
 ) {
-    private val pressSpec = spring(dampingRatio = 0.5f, stiffness = 300f, visibilityThreshold = 0.001f)
+    private val pressDownSpec = tween<Float>(
+        durationMillis = 120,
+        easing = CubicBezierEasing(0.2f, 0.8f, 0.2f, 1f),
+    )
+    private val releaseSpringSpec = spring(
+        dampingRatio = 0.45f,
+        stiffness = 420f,
+        visibilityThreshold = 0.001f,
+    )
     private val pressAnimation = Animatable(0f, 0.001f)
 
     /** 0f at rest, animating to 1f while pressed. Read in draw/effect/layer blocks. */
     val pressProgress: Float get() = pressAnimation.value
 
-    /** Local-space touch point used as the centre of the press glow. */
+    /** Local-space touch point used as the centre of the touch sheen. */
     var touchPosition by mutableStateOf(Offset.Zero)
         private set
 
@@ -423,10 +639,10 @@ class GlassInteraction(
             inspectDragGestures(
                 onDragStart = { down ->
                     touchPosition = down.position
-                    animationScope.launch { pressAnimation.animateTo(1f, pressSpec) }
+                    animationScope.launch { pressAnimation.animateTo(1f, pressDownSpec) }
                 },
-                onDragEnd = { animationScope.launch { pressAnimation.animateTo(0f, pressSpec) } },
-                onDragCancel = { animationScope.launch { pressAnimation.animateTo(0f, pressSpec) } },
+                onDragEnd = { animationScope.launch { pressAnimation.animateTo(0f, releaseSpringSpec) } },
+                onDragCancel = { animationScope.launch { pressAnimation.animateTo(0f, releaseSpringSpec) } },
             ) { change, _ ->
                 touchPosition = change.position
             }
@@ -440,27 +656,25 @@ fun rememberGlassInteraction(): GlassInteraction {
 }
 
 /**
- * Shared frosted-glass recipe. Single source of truth for every liquid-glass
- * surface: nav bar, dock, FAB, mini-player, player controls, pills and icon
- * buttons all funnel through [drawInteractiveGlass], so the frost level is
- * defined here once and cannot drift between the two [liquidGlass] overloads.
+ * Water-clear glass constants calibrated to match `walkthrough.md`:
+ * blur(4px) saturate(160%), zero chalky border, zero resting milkiness.
  */
 private object GlassRecipe {
-    const val BLUR_BASE_DP = 12f
-    const val BLUR_BRIGHT_DP = 20f
-    const val BLUR_DARK_DP = 6f
-
-    const val BRIGHTNESS = 0.05f
+    const val BLUR_BRIGHT_BOOST_DP = 2f
     const val CONTRAST = 1f
-    const val SATURATION = 1.1f
-
-    const val LENS_DIVISOR = 6f
-
-    const val MIN_SCRIM = 0.18f
-    const val MAX_SCRIM = 0.56f
-
-    const val PRESS_BLUR_DP = 2f
+    const val MIN_SCRIM = 0f
+    const val MAX_SCRIM = 0.14f
+    const val PRESS_BLUR_DP = 1.5f
+    const val DROPLET_PRESS_X = 0.955f
+    const val DROPLET_PRESS_Y = 0.935f
 }
+
+private val DisabledChalkHighlight = Highlight(
+    width = 0.dp,
+    blurRadius = 0.dp,
+    alpha = 0f,
+    style = HighlightStyle.Plain(),
+)
 
 /**
  * Interactive liquid glass drawing modifier.
@@ -473,76 +687,136 @@ fun Modifier.drawInteractiveGlass(
     luminanceAnimation: Float,
     shape: Shape,
     interaction: GlassInteraction?,
-    pressedScale: Float = 1.12f,
-    highlight: Highlight = Highlight.Default,
+    pressedScale: Float = GlassRecipe.DROPLET_PRESS_X,
+    highlight: Highlight = DisabledChalkHighlight,
     blurScale: Float = 1f,
     minScrim: Float = GlassRecipe.MIN_SCRIM,
     maxScrim: Float = GlassRecipe.MAX_SCRIM,
-): Modifier =
-    this
+    optics: LiquidGlassOptics = LiquidGlassOptics.Floating,
+    pressedScaleY: Float = if (pressedScale < 1f) GlassRecipe.DROPLET_PRESS_Y else pressedScale,
+): Modifier {
+    val safeShape = lensSafeGlassShape(shape)
+    val zeroRadiusRect = shape == RectangleShape ||
+        (shape is RoundedCornerShape && shape == RoundedCornerShape(0.dp))
+
+    return this
         .drawBackdrop(
             backdrop = backdrop,
-            shape = { lensSafeGlassShape(shape) },
-            highlight = { highlight },
+            shape = { safeShape },
+            highlight = {
+                if (highlight === Highlight.Default) DisabledChalkHighlight else highlight
+            },
+            shadow = {
+                if (zeroRadiusRect) {
+                    null
+                } else if (isDark) {
+                    Shadow(
+                        radius = 26.dp,
+                        offset = DpOffset(0.dp, 10.dp),
+                        color = Color.Black,
+                        alpha = 0.38f,
+                    )
+                } else {
+                    Shadow(
+                        radius = 24.dp,
+                        offset = DpOffset(0.dp, 10.dp),
+                        color = Color(0xFF12100C),
+                        alpha = 0.16f,
+                    )
+                }
+            },
             effects = {
-                val l = (luminanceAnimation * 2f - 1f).let { sign(it) * it * it }
+                val brightFactor = ((luminanceAnimation - 0.5f) / 0.5f).coerceIn(0f, 1f)
                 val press = interaction?.pressProgress ?: 0f
                 colorControls(
-                    brightness = GlassRecipe.BRIGHTNESS,
+                    brightness = optics.brightness,
                     contrast = GlassRecipe.CONTRAST,
-                    saturation = GlassRecipe.SATURATION,
+                    saturation = optics.saturation,
                 )
-                blur(
-                    (
-                        if (l > 0f) {
-                            lerp(
-                                GlassRecipe.BLUR_BASE_DP.dp.toPx(),
-                                GlassRecipe.BLUR_BRIGHT_DP.dp.toPx(),
-                                l,
-                            )
-                        } else {
-                            lerp(
-                                GlassRecipe.BLUR_BASE_DP.dp.toPx(),
-                                GlassRecipe.BLUR_DARK_DP.dp.toPx(),
-                                -l,
-                            )
-                        }
-                    ) * blurScale + GlassRecipe.PRESS_BLUR_DP.dp.toPx() * press,
-                )
-                lens(
-                    size.minDimension / GlassRecipe.LENS_DIVISOR +
-                        GlassRecipe.PRESS_BLUR_DP.dp.toPx() * press,
-                    size.minDimension / 2f,
-                    false,
-                )
+                val blurRadiusPx = (
+                    (optics.blurDp + GlassRecipe.BLUR_BRIGHT_BOOST_DP * brightFactor) * blurScale +
+                        GlassRecipe.PRESS_BLUR_DP * press
+                    ).dp.toPx()
+                if (blurRadiusPx > 0.5f) {
+                    blur(blurRadiusPx)
+                }
+                val corners = resolveCornerRadiiPx(safeShape, size, layoutDirection, this)
+                runtimeShaderEffect(
+                    key = C1_DOME_REFRACTION_SHADER_KEY,
+                    shaderString = C1_DOME_REFRACTION_SHADER,
+                    uniformShaderName = "content",
+                ) {
+                    setFloatUniform("size", size.width, size.height)
+                    setFloatUniform("offset", -padding, -padding)
+                    setFloatUniform("cornerRadii", corners)
+                    setFloatUniform("bezel", optics.bezel)
+                    setFloatUniform("curvature", optics.curvature)
+                    setFloatUniform("refractionAmount", optics.refractionDp.dp.toPx())
+                    setFloatUniform("chroma", optics.chroma)
+                    setFloatUniform("maxSlope", optics.maxSlope)
+                }
             },
             onDrawBackdrop = { drawBackdrop ->
                 drawBackdrop()
             },
             onDrawSurface = {
-                val darken = lerp(minScrim, maxScrim, ((luminanceAnimation - 0.3f) / 0.5f).coerceIn(0f, 1f))
-                drawRect((if (isDark) Color.Black else Color.White).copy(alpha = darken))
-                val press = interaction?.pressProgress ?: 0f
-                if (press > 0f) {
-                    drawRect(
-                        brush = Brush.radialGradient(
-                            colors = listOf(
-                                Color.White.copy(alpha = 0.18f * press),
-                                Color.Transparent,
+                if (size.width > 0f && size.height > 0f) {
+                    val brightOver50 = ((luminanceAnimation - 0.5f) / 0.5f).coerceIn(0f, 1f)
+                    val adaptiveScrim = lerp(minScrim, maxScrim, brightOver50)
+                    if (adaptiveScrim > 0.001f) {
+                        drawRect((if (isDark) Color.Black else Color.White).copy(alpha = adaptiveScrim))
+                    }
+
+                    val press = interaction?.pressProgress ?: 0f
+                    if (press > 0.001f) {
+                        val sheenCenter = interaction?.touchPosition?.takeIf { it != Offset.Zero }
+                            ?: Offset(size.width * 0.26f, size.height * 0.18f)
+                        val sheenRadius = max(90.dp.toPx(), size.minDimension * 1.15f)
+                        drawRect(
+                            brush = Brush.radialGradient(
+                                0.0f to Color.White.copy(alpha = 0.22f * press),
+                                0.68f to Color.Transparent,
+                                1.0f to Color.Transparent,
+                                center = sheenCenter,
+                                radius = sheenRadius,
                             ),
-                            center = interaction?.touchPosition ?: Offset(size.width / 2f, size.height / 2f),
-                            radius = size.minDimension * 1.2f,
-                        ),
-                        blendMode = BlendMode.Plus,
+                            blendMode = BlendMode.Plus,
+                        )
+                    }
+
+                    val outline = safeShape.createOutline(size, layoutDirection, this)
+                    val outerRingColor = if (isDark) {
+                        Color.White.copy(alpha = 0.10f)
+                    } else {
+                        Color.Black.copy(alpha = 0.14f)
+                    }
+                    // Clipped by surface shape: 1.dp stroke renders as crisp 0.5.dp outer contrast hairline.
+                    drawOutline(
+                        outline = outline,
+                        color = outerRingColor,
+                        style = Stroke(width = 1.dp.toPx()),
+                    )
+
+                    val meniscusBrush = Brush.verticalGradient(
+                        0.0f to Color.White.copy(alpha = if (isDark) 0.32f else 0.28f),
+                        0.32f to Color.Transparent,
+                        0.68f to Color.Transparent,
+                        1.0f to Color.White.copy(alpha = if (isDark) 0.12f else 0.10f),
+                    )
+                    // Clipped by surface shape: 1.5.dp stroke renders as exact 0.75.dp inset meniscus rim.
+                    drawOutline(
+                        outline = outline,
+                        brush = meniscusBrush,
+                        style = Stroke(width = 1.5.dp.toPx()),
                     )
                 }
             },
             layerBlock =
                 if (interaction != null) {
                     {
-                        val scale = lerp(1f, pressedScale, interaction.pressProgress)
-                        scaleX = scale
-                        scaleY = scale
+                        val press = interaction.pressProgress
+                        scaleX = lerp(1f, pressedScale, press)
+                        scaleY = lerp(1f, pressedScaleY, press)
                     }
                 } else {
                     null
@@ -554,26 +828,24 @@ fun Modifier.drawInteractiveGlass(
                 Modifier
             },
         )
+}
 
 /**
- * lens-safe shape guard: kyant's lens effect (used by every interactive
- * glass surface) only accepts corner-based shapes — its SDF shader throws
- * "Only RoundedRectangularShape or CornerBasedShape is supported" for a
- * plain [RectangleShape], which took the render pass down with it (the
- * MD3 navigation bar's glass chrome). Square shapes map to a zero-radius
- * [RoundedCornerShape]: identical rectangle visuals, valid lens input.
+ * lens-safe shape guard: kyant's backdrop effects only accept corner-based shapes;
+ * plain [RectangleShape] maps to a zero-radius [RoundedCornerShape].
  */
 internal fun lensSafeGlassShape(shape: Shape): Shape =
     if (shape == RectangleShape) RoundedCornerShape(0.dp) else shape
 
-/** Interactive liquidGlass: static surfaces use fixed mid-luminance. */
+/** Interactive liquidGlass: resting surfaces stay crystal clear (`luminanceAnimation = 0.5f`). */
 @Composable
 fun Modifier.liquidGlass(
     backdrop: Backdrop,
     shape: Shape = CircleShape,
     interactive: Boolean = true,
-    highlight: Highlight = Highlight.Default,
+    highlight: Highlight = DisabledChalkHighlight,
     forceDark: Boolean = false,
+    optics: LiquidGlassOptics = LiquidGlassOptics.Floating,
 ): Modifier {
     if (!LocalLiquidGlass.current) {
         return this
@@ -596,6 +868,7 @@ fun Modifier.liquidGlass(
         shape = shape,
         interaction = if (interactive) interaction else null,
         highlight = highlight,
+        optics = optics,
     )
 }
 
@@ -611,6 +884,7 @@ fun Modifier.liquidGlass(
     minScrim: Float = GlassRecipe.MIN_SCRIM,
     maxScrim: Float = GlassRecipe.MAX_SCRIM,
     forceDark: Boolean = false,
+    optics: LiquidGlassOptics = LiquidGlassOptics.Floating,
 ): Modifier {
     if (!LocalLiquidGlass.current || !isLiquidGlassBackdropSupported()) {
         return this
@@ -626,10 +900,12 @@ fun Modifier.liquidGlass(
         luminanceAnimation = luminanceAnimation,
         shape = shape,
         interaction = if (interactive) interaction else null,
-        pressedScale = 1.04f,
+        pressedScale = 0.985f,
+        pressedScaleY = 0.975f,
         blurScale = blurScale,
         minScrim = minScrim,
         maxScrim = maxScrim,
+        optics = optics,
     )
 }
 
@@ -639,7 +915,7 @@ fun LiquidGlassContainer(
     modifier: Modifier = Modifier,
     shape: Shape = CircleShape,
     interactive: Boolean = true,
-    highlight: Highlight = Highlight.Default,
+    highlight: Highlight = DisabledChalkHighlight,
     contentAlignment: Alignment = Alignment.Center,
     content: @Composable BoxScope.() -> Unit,
 ) {
@@ -679,13 +955,13 @@ fun LiquidGlassActionPill(
         return
     }
     Row(
-        modifier = modifier.liquidGlass(backdrop, shape, true, Highlight.Default),
+        modifier = modifier.liquidGlass(backdrop, shape, true, DisabledChalkHighlight),
         verticalAlignment = Alignment.CenterVertically,
         content = content,
     )
 }
 
-/** LiquidGlassIconButton: ImageVector version, small circles use narrow highlight. */
+/** LiquidGlassIconButton: ImageVector version. */
 @Composable
 fun LiquidGlassIconButton(
     backdrop: Backdrop?,
@@ -695,7 +971,7 @@ fun LiquidGlassIconButton(
     shape: Shape = CircleShape,
     tint: Color = Color.White,
     interactive: Boolean = true,
-    highlight: Highlight = Highlight(width = 1.dp),
+    highlight: Highlight = DisabledChalkHighlight,
 ) {
     LiquidGlassContainer(
         backdrop = backdrop,
@@ -729,7 +1005,7 @@ fun LiquidGlassIconButton(
         modifier = modifier,
         shape = shape,
         interactive = true,
-        highlight = Highlight(width = 1.dp),
+        highlight = DisabledChalkHighlight,
     ) {
         Icon(
             painter = painter,
@@ -740,9 +1016,8 @@ fun LiquidGlassIconButton(
     }
 }
 
-// ── Compat shims: keep old symbols compiling, route to interactive liquid glass ──
+// ── Compat shims: route active glass presets to C1-dome optical presets ────────
 
-/** Kept for call-site compat; values are ignored — recipe is fixed. */
 enum class LiquidGlassPreset {
     BottomNavigation,
     MiniPlayer,
@@ -767,9 +1042,21 @@ private fun LiquidGlassPreset.isGlassTarget(): Boolean = when (this) {
     LiquidGlassPreset.Card -> false
 }
 
+private fun LiquidGlassPreset.toOptics(): LiquidGlassOptics = when (this) {
+    LiquidGlassPreset.BottomNavigation,
+    LiquidGlassPreset.Header -> LiquidGlassOptics.NavPill
+    LiquidGlassPreset.MiniPlayer,
+    LiquidGlassPreset.PlayerControls,
+    LiquidGlassPreset.FloatingControls,
+    LiquidGlassPreset.ModalSheet,
+    LiquidGlassPreset.ContextMenu,
+    LiquidGlassPreset.Overlay,
+    LiquidGlassPreset.Card -> LiquidGlassOptics.Floating
+}
+
 /**
- * Compat shim: old liquidGlassChrome now delegates to drawInteractiveGlass
- * for allowed targets only; all other presets return unmodified (opaque fallback).
+ * Routes active glass presets to [liquidGlass] with preset-matched optics
+ * (NavPill 11dp/0.62/0.24 chroma vs Floating 20dp/0.65/0.28 chroma).
  */
 @Composable
 fun Modifier.liquidGlassChrome(
@@ -788,7 +1075,7 @@ fun Modifier.liquidGlassChrome(
         return this
     }
     // PlayerControls and FloatingControls in Now Playing always use dark-glass
-    // styling matching dark mode so they remain crisp and legible against immersive media backdrops.
+    // styling so they stay sharp over dark blurred artwork backdrops.
     val shouldForceDark = forceDark ||
         preset == LiquidGlassPreset.PlayerControls ||
         preset == LiquidGlassPreset.FloatingControls
@@ -796,14 +1083,14 @@ fun Modifier.liquidGlassChrome(
         backdrop = backdrop,
         shape = shape,
         interactive = preset != LiquidGlassPreset.BottomNavigation && preset != LiquidGlassPreset.Header,
-        highlight = Highlight.Default,
+        highlight = DisabledChalkHighlight,
         forceDark = shouldForceDark,
+        optics = preset.toOptics(),
     )
 }
 
 /**
- * Crash-free stub: old BackdropBlur did a full-screen 36dp sibling blur inside
- * its own capture (self-capture loop). Now draws only a veil, no backdrop.
+ * Veil overlay replacing deprecated full-screen self-capture blur loops.
  */
 @Composable
 fun BackdropBlur(
