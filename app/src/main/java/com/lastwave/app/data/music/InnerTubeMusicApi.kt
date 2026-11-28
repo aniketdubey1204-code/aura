@@ -22,7 +22,10 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import java.io.File
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -253,6 +256,8 @@ class InnerTubeMusicApi @Inject constructor(
     private val matchCache = ConcurrentHashMap<String, YouTubeMusicTrack>()
     private val streamCache = ConcurrentHashMap<StreamCacheKey, CachedStream>()
     private val activeStreamRequests = ConcurrentHashMap<String, SharedStreamRequest>()
+    private val browseCache = ConcurrentHashMap<String, Pair<Long, JsonObject>>()
+    private val activeBrowseRequests = ConcurrentHashMap<String, Deferred<JsonObject>>()
     @Volatile
     private var podcastEpisodesFilter: String? = null
     private val apiScope = CoroutineScope(
@@ -1726,7 +1731,61 @@ class InnerTubeMusicApi @Inject constructor(
             }.getOrElse { false }
         }
 
+    fun loadCachedHomePageSnapshot(): HomePage? {
+        val dir = diskCacheDir ?: return null
+        val scopeHash = playbackAuthScope().hashCode()
+        val file = File(dir, "yt_home_$scopeHash.json")
+        if (!file.exists()) return null
+        return runCatching {
+            val raw = file.readText()
+            if (raw.isBlank()) return@runCatching null
+            val root = json.parseToJsonElement(raw).asObject() ?: return@runCatching null
+            HomePage(
+                shelves = parseHomeShelves(root),
+                chips = parseHomeChips(root),
+                continuationToken = runCatching { parseHomeContinuationToken(root) }.getOrNull(),
+                backgroundUrl = runCatching { parseBackgroundHeroUrl(root) }.getOrNull(),
+            ).takeIf { it.shelves.isNotEmpty() }
+        }.getOrNull()
+    }
+
+    private fun saveHomeSnapshotToDisk(scopeHash: Int, root: JsonObject) {
+        val dir = diskCacheDir ?: return
+        runCatching {
+            val file = File(dir, "yt_home_$scopeHash.json")
+            file.writeText(root.toString())
+        }
+    }
+
     private suspend fun browseRoot(browseId: String, authenticated: Boolean, params: String? = null): JsonObject {
+        val scope = playbackAuthScope()
+        val reqKey = "$browseId|$authenticated|${params.orEmpty()}|$scope"
+        val now = SystemClock.elapsedRealtime()
+        browseCache[reqKey]?.let { (ts, cached) ->
+            if (now - ts < BROWSE_COALESCE_TTL_MS) return cached
+        }
+        browseCache.entries.removeIf { now - it.value.first > BROWSE_CACHE_PRUNE_MS }
+        val shared = activeBrowseRequests.computeIfAbsent(reqKey) {
+            lateinit var job: Deferred<JsonObject>
+            job = apiScope.async(start = CoroutineStart.LAZY) {
+                browseRootUncached(browseId, authenticated, params)
+            }
+            job.invokeOnCompletion { activeBrowseRequests.remove(reqKey, job) }
+            job
+        }
+        shared.start()
+        val result = shared.await()
+        if (result.obj("contents")?.isNotEmpty() == true) {
+            browseCache[reqKey] = SystemClock.elapsedRealtime() to result
+            if (browseId == YT_HOME_BROWSE_ID && params.isNullOrBlank()) {
+                val scopeHash = scope.hashCode()
+                apiScope.launch { saveHomeSnapshotToDisk(scopeHash, result) }
+            }
+        }
+        return result
+    }
+
+    private suspend fun browseRootUncached(browseId: String, authenticated: Boolean, params: String? = null): JsonObject {
         var config = getWebConfig()
         suspend fun executeBrowse(cfg: WebConfig): JsonObject {
             return post(
@@ -3184,54 +3243,77 @@ class InnerTubeMusicApi @Inject constructor(
         val signedIn = ytAuth.connection.value.isConnected
         val deadline = SystemClock.elapsedRealtime() +
             if (signedIn) AUTHENTICATED_CIPHER_PATH_BUDGET_MS else DIRECT_FAST_PATH_BUDGET_MS
-        for (client in ordered) {
+        for (batch in ordered.chunked(2)) {
             val remaining = deadline - SystemClock.elapsedRealtime()
             if (remaining <= 0L) {
                 noteAttempt("direct-fast=budget-exhausted")
                 return null
             }
-            var failed = false
-            val stream = try {
-                val clientBudget = if (signedIn && client.name == "WEB_REMIX") {
-                    AUTHENTICATED_CIPHER_CLIENT_BUDGET_MS
-                } else DIRECT_FAST_CLIENT_TIMEOUT_MS
-                kotlinx.coroutines.withTimeoutOrNull(minOf(clientBudget, remaining)) {
-                    val cipherContext = if (signedIn && client.name == "WEB_REMIX") {
-                        innerTubeXExtractor.fetchCipherContext(videoId)
-                    } else null
-                    val sigTimestamp = cipherContext?.signatureTimestamp ?: if (client.needsSignatureTimestamp) {
-                        streamExtractor.getSignatureTimestamp(videoId)
-                    } else null
-                    if (cipherContext != null) {
-                        noteAttempt("client=${client.name} cipherContext=paired")
+            val winner = coroutineScope {
+                val ch = kotlinx.coroutines.channels.Channel<Pair<YouTubeAudioStream, String>>(batch.size)
+                val jobs = batch.map { client ->
+                    launch(Dispatchers.IO) {
+                        var failed = false
+                        val stream = try {
+                            val clientBudget = if (signedIn && client.name == "WEB_REMIX") {
+                                AUTHENTICATED_CIPHER_CLIENT_BUDGET_MS
+                            } else DIRECT_FAST_CLIENT_TIMEOUT_MS
+                            kotlinx.coroutines.withTimeoutOrNull(minOf(clientBudget, remaining)) {
+                                val cipherContext = if (signedIn && client.name == "WEB_REMIX") {
+                                    innerTubeXExtractor.fetchCipherContext(videoId)
+                                } else null
+                                val sigTimestamp = cipherContext?.signatureTimestamp ?: if (client.needsSignatureTimestamp) {
+                                    streamExtractor.getSignatureTimestamp(videoId)
+                                } else null
+                                if (cipherContext != null) {
+                                    noteAttempt("client=${client.name} cipherContext=paired")
+                                }
+                                resolveDirectClientStream(
+                                    videoId = videoId,
+                                    client = client,
+                                    visitorData = visitorData,
+                                    signatureTimestamp = sigTimestamp,
+                                    cipherContext = cipherContext,
+                                    playerPoToken = if (client.needsPoToken) poToken?.playerToken else null,
+                                    gvsPoToken = if (client.needsGvsPoToken) poToken?.sessionToken else null,
+                                    authScope = authScope,
+                                    probeCandidates = true,
+                                    allowCipherFormats = client.name == "TVHTML5_SIMPLY_EMBEDDED_PLAYER" || client.name == "WEB_REMIX" || client.name == "IOS" || client.name == "TVHTML5",
+                                    maxAttempts = 1,
+                                )
+                            }
+                        } catch (cancellation: kotlinx.coroutines.CancellationException) {
+                            throw cancellation
+                        } catch (error: Exception) {
+                            failed = true
+                            noteAttempt("client=${client.name} outcome=error ${resolutionFailureDetail(error)}")
+                            null
+                        }
+                        if (stream != null) {
+                            noteAttempt("client=${client.name} outcome=direct-url itag=${stream.itag ?: -1}")
+                            ch.trySend(stream to client.name)
+                        } else if (!failed) {
+                            noteAttempt("client=${client.name} outcome=timeout")
+                        }
                     }
-                    resolveDirectClientStream(
-                        videoId = videoId,
-                        client = client,
-                        visitorData = visitorData,
-                        signatureTimestamp = sigTimestamp,
-                        cipherContext = cipherContext,
-                        playerPoToken = if (client.needsPoToken) poToken?.playerToken else null,
-                        gvsPoToken = if (client.needsGvsPoToken) poToken?.sessionToken else null,
-                        authScope = authScope,
-                        probeCandidates = true,
-                        allowCipherFormats = client.name == "TVHTML5_SIMPLY_EMBEDDED_PLAYER" || client.name == "WEB_REMIX" || client.name == "IOS" || client.name == "TVHTML5",
-                        maxAttempts = 1,
-                    )
                 }
-            } catch (cancellation: kotlinx.coroutines.CancellationException) {
-                throw cancellation
-            } catch (error: Exception) {
-                failed = true
-                noteAttempt("client=${client.name} outcome=error ${resolutionFailureDetail(error)}")
-                null
+                val remCount = AtomicInteger(jobs.size)
+                jobs.forEach { j ->
+                    j.invokeOnCompletion {
+                        if (remCount.decrementAndGet() == 0) ch.close()
+                    }
+                }
+                try {
+                    ch.receiveCatching().getOrNull()
+                } finally {
+                    ch.close()
+                    jobs.forEach { it.cancel() }
+                }
             }
-            if (stream != null) {
-                noteAttempt("client=${client.name} outcome=direct-url itag=${stream.itag ?: -1}")
-                lastSuccessfulClientName = client.name
-                return stream
+            if (winner != null) {
+                lastSuccessfulClientName = winner.second
+                return winner.first
             }
-            if (!failed) noteAttempt("client=${client.name} outcome=timeout")
         }
         noteAttempt("direct-fast=exhausted")
         return null
@@ -3554,7 +3636,17 @@ class InnerTubeMusicApi @Inject constructor(
             return candidates.firstOrNull()
                 ?: throw IOException("${client.key} returned no usable audio URL")
         }
-        for (candidate in candidates.take(MAX_FORMAT_PROBES_PER_CLIENT)) {
+        val topCandidates = candidates.take(MAX_FORMAT_PROBES_PER_CLIENT)
+        val firstBatch = topCandidates.take(2)
+        if (firstBatch.isNotEmpty()) {
+            val probed = coroutineScope {
+                firstBatch.map { c ->
+                    async(Dispatchers.IO) { if (probeStream(c, "client-probe")) c else null }
+                }.awaitAll()
+            }.firstOrNull { it != null }
+            if (probed != null) return probed
+        }
+        for (candidate in topCandidates.drop(2)) {
             if (probeStream(candidate, "client-probe")) return candidate
         }
         throw IOException("${client.key} returned no usable audio URL")
@@ -5284,18 +5376,22 @@ class InnerTubeMusicApi @Inject constructor(
         /** Per-client bound for the direct-URL fast path (single POST, no
          *  extras). Relaxed for slow devices: a fast first success still
          *  wins the race, only the worst case waits longer. */
-        const val DIRECT_FAST_CLIENT_TIMEOUT_MS = 4_000L
+        @Volatile
+        var diskCacheDir: File? = null
+        const val BROWSE_COALESCE_TTL_MS = 6_000L
+        const val BROWSE_CACHE_PRUNE_MS = 30_000L
+        const val DIRECT_FAST_CLIENT_TIMEOUT_MS = 2_500L
         /** Bound for the mandatory visitor-data bootstrap on the fast path.
          *  VISIONOS/ANDROID_VR answer LOGIN_REQUIRED with zero formats when
          *  visitor data is missing, so a resolve without it burns the whole
          *  fast-path budget on guaranteed misses. */
-        const val VISITOR_BOOTSTRAP_BUDGET_MS = 3_000L
+        const val VISITOR_BOOTSTRAP_BUDGET_MS = 1_200L
         /** Cooldown before the fast path retries a failed visitor bootstrap. */
         const val VISITOR_BOOTSTRAP_RETRY_COOLDOWN_MS = 60_000L
         /** Bound for a warm PoToken mint on the fast path. The engine is
          *  pre-warmed at startup, so a cache hit lands in milliseconds;
          *  anything slower proceeds without a token. */
-        const val POTOKEN_FAST_BUDGET_MS = 1_000L
+        const val POTOKEN_FAST_BUDGET_MS = 350L
         /** Whole fast path must settle inside this budget before heavier stages run. */
         const val DIRECT_FAST_PATH_BUDGET_MS = 6_000L
         // A signed-in web response may require a cold local JS solver; anonymous clients keep their short budget.
@@ -5327,7 +5423,7 @@ class InnerTubeMusicApi @Inject constructor(
         const val SEARCH_REQUEST_TIMEOUT_MS = 10_000L
         const val ACCOUNT_SWITCHER_TIMEOUT_MS = 15_000L
         /** Per-probe socket timeout for the 0-1 byte stream validity check. */
-        const val STREAM_PROBE_TIMEOUT_MS = 6_000L
+        const val STREAM_PROBE_TIMEOUT_MS = 2_500L
         const val HISTORY_PING_TIMEOUT_MS = 15_000L
         const val URL_EXPIRY_MARGIN_MS = 2 * 60 * 1000L
         const val REQUEST_RETRY_BASE_DELAY_MS = 250L

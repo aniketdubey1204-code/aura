@@ -35,6 +35,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -143,7 +144,34 @@ class FeedRepository @Inject constructor(
         val podcastsEnabled = settingsPreferences.settings.first().podcastsEnabled
         val cacheKey = "${username.orEmpty()}|$connectionPre|podcasts=$podcastsEnabled"
         val previous = cachedFeed?.takeIf { cachedKey == cacheKey }
-        previous?.let(onUpdate)
+        if (previous != null) {
+            onUpdate(previous)
+        } else {
+            val diskHome = withContext(Dispatchers.IO) {
+                runCatching { innerTube.loadCachedHomePageSnapshot() }.getOrNull()
+            }
+            if (diskHome != null && diskHome.shelves.isNotEmpty()) {
+                val snapshotPicks = diskHome.shelves
+                    .flatMap { it.items }
+                    .filterIsInstance<HomeShelfItem.Track>()
+                    .map { it.track }
+                    .distinctBy { it.videoId.ifBlank { it.title } }
+                    .take(18)
+                onUpdate(
+                    FeedData(
+                        isYtConnected = connectionPre.isConnected,
+                        ytAccountName = connectionPre.accountName.takeIf { connectionPre.isConnected },
+                        userName = username,
+                        hasYtRecommendations = snapshotPicks.isNotEmpty(),
+                        hasPersonalContent = snapshotPicks.isNotEmpty(),
+                        nativeShelves = diskHome.shelves,
+                        homeChips = diskHome.chips,
+                        homeContinuationToken = diskHome.continuationToken,
+                        quickPicks = snapshotPicks,
+                    )
+                )
+            }
+        }
         val random = kotlin.random.Random(System.nanoTime())
         val connection = connectionPre
         val isYtConnected = connection.isConnected
@@ -236,18 +264,39 @@ class FeedRepository @Inject constructor(
             } else emptyList()
         }
 
-        val releaseCandidates = newReleasesDef.await()
-        val charts = chartsDef.await()
-        val homePlaylists = homeMixesDef.await().filter {
-            it.id.startsWith("PL") || it.id.startsWith("RD") || it.id.startsWith("OLAK") || it.id == "LM"
-        }
-        val homeSongs = homeSongsDef.await()
         val homePage = homePageDef.await()
         val nativeShelves = homePage.shelves.ifEmpty {
             runCatching { innerTube.fetchHomeShelves() }.getOrDefault(emptyList())
         }
         val homeChips = homePage.chips
         val homeContinuationToken = homePage.continuationToken
+        if (nativeShelves.isNotEmpty()) {
+            val earlyPicks = nativeShelves
+                .flatMap { it.items }
+                .filterIsInstance<HomeShelfItem.Track>()
+                .map { it.track }
+                .distinctBy { it.videoId.ifBlank { it.title } }
+                .take(18)
+            onUpdate(
+                (previous ?: FeedData()).copy(
+                    isYtConnected = isYtConnected,
+                    ytAccountName = connection.accountName.takeIf { isYtConnected },
+                    userName = username,
+                    hasYtRecommendations = earlyPicks.isNotEmpty(),
+                    hasPersonalContent = earlyPicks.isNotEmpty(),
+                    nativeShelves = nativeShelves,
+                    homeChips = homeChips,
+                    homeContinuationToken = homeContinuationToken,
+                    quickPicks = earlyPicks,
+                )
+            )
+        }
+        val releaseCandidates = newReleasesDef.await()
+        val charts = chartsDef.await()
+        val homePlaylists = homeMixesDef.await().filter {
+            it.id.startsWith("PL") || it.id.startsWith("RD") || it.id.startsWith("OLAK") || it.id == "LM"
+        }
+        val homeSongs = homeSongsDef.await()
         val recentTracks = recentTracksDef.await()
         val friends = friendsDef.await()
         val tasteProfile = tasteProfileDef.await()

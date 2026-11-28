@@ -1017,7 +1017,9 @@ class MusicPlayer @Inject constructor(
                 decodedSampleRateHz = 0
                 stream?.let { s ->
                     publishResolvedQuality(s, expectedMediaId = mediaItem.mediaId)
-                    applyDacRoutingFor(dacRateFor(s), s.audioCodec)
+                    if (outgoingPlayer == null) {
+                        applyDacRoutingFor(dacRateFor(s), s.audioCodec)
+                    }
                     if (!s.isLossless && s.audioCodec != "DOLBY ATMOS") {
                         scheduleQualityUpgrade(
                             track = currentTrack,
@@ -1027,7 +1029,9 @@ class MusicPlayer @Inject constructor(
                         )
                     }
                 } ?: run {
-                    applyDacRoutingFor(currentSourceRateHz())
+                    if (outgoingPlayer == null) {
+                        applyDacRoutingFor(currentSourceRateHz())
+                    }
                 }
                 if (outgoingPlayer == null) cancelCrossfade()
                 // Queue placeholders are intentionally non-playable until
@@ -1407,8 +1411,8 @@ class MusicPlayer @Inject constructor(
             .setBufferDurationsMs(
                 /* minBufferMs = */ if (handleAudioFocus) 45_000 else 15_000,
                 /* maxBufferMs = */ if (handleAudioFocus) 120_000 else 30_000,
-                /* bufferForPlaybackMs = */ if (handleAudioFocus) 250 else 1_500,
-                /* bufferForPlaybackAfterRebufferMs = */ if (handleAudioFocus) 750 else 2_500,
+                /* bufferForPlaybackMs = */ 250,
+                /* bufferForPlaybackAfterRebufferMs = */ 500,
             )
             .setPrioritizeTimeOverSizeThresholds(true)
             .setBackBuffer(15_000, true)
@@ -1717,7 +1721,9 @@ class MusicPlayer @Inject constructor(
                 addListener(object : Player.Listener {
                     override fun onAudioSessionIdChanged(audioSessionId: Int) {
                         effects.attach(audioSessionId)
-                        runCatching { systemEffectsBridge.onSessionChanged(audioSessionId) }
+                        if (activePlayer === this@apply || (activePlayer == null && handleAudioFocus)) {
+                            runCatching { systemEffectsBridge.onSessionChanged(audioSessionId) }
+                        }
                     }
                 })
             }.also { playerInstance ->
@@ -1847,6 +1853,11 @@ class MusicPlayer @Inject constructor(
             outgoingPlayer = null
             toStop?.stop()
             toStop?.clearMediaItems()
+            val active = activePlayer
+            if (active != null && active.audioSessionId != C.AUDIO_SESSION_ID_UNSET) {
+                runCatching { systemEffectsBridge.onSessionChanged(active.audioSessionId) }
+            }
+            applyDacRoutingFor(currentSourceRateHz(), _state.value.audioCodec)
         }
         setupSpatializerListener()
         runCatching { restorePlaybackSession() }.getOrElse { error ->
@@ -1932,8 +1943,12 @@ class MusicPlayer @Inject constructor(
                                 ?: preparedStreams.values.firstOrNull { it.url == nextItem?.localConfiguration?.uri?.toString() }
                             val nextStreamUrl = stream?.url ?: nextItem?.localConfiguration?.uri?.toString()
 
+                            val blendPhase = _state.value.deckBlendTelemetry.phase
+                            val isBlendingNow = outgoingPlayer != null ||
+                                blendPhase == com.lastwave.app.playback.automix.api.BlendPhase.BLENDING ||
+                                blendPhase == com.lastwave.app.playback.automix.api.BlendPhase.LOOP_LOCKED
                             val transitionActive = crossfadeEnabled || autoMixCoordinator.get().isEnabled
-                            if (transitionActive && upcomingIdx != C.INDEX_UNSET && nextItem != null) {
+                            if (transitionActive && !isBlendingNow && upcomingIdx != C.INDEX_UNSET && nextItem != null) {
                                 val remainingMs = dur - pos
                                 val isNextNonPlaceholder = nextItem.localConfiguration?.uri?.scheme?.let { it != "lastwave" } == true
                                 val isStreamDead = stream?.isExpired() == true
@@ -3896,10 +3911,12 @@ class MusicPlayer @Inject constructor(
         exclusiveUsbOutput.setWanted(exclusiveWanted)
         val internalWanted = !isSpatial && internalDirectWanted()
         internalDirectOutput.setWanted(internalWanted)
+        val activeSink = if (playerDelegate.isInitialized()) playerToSink[player] else null
         audioSinks.forEach { sink ->
-            sink.setBitPerfectRequested(!isSpatial && bitPerfectEnabled)
-            sink.syncExclusiveUsb(exclusiveWanted)
-            sink.syncInternalDirect(internalWanted)
+            val isLiveSink = activeSink == null || sink === activeSink
+            sink.setBitPerfectRequested(isLiveSink && !isSpatial && bitPerfectEnabled)
+            sink.syncExclusiveUsb(isLiveSink && exclusiveWanted)
+            sink.syncInternalDirect(isLiveSink && internalWanted)
         }
         val exclusive = exclusiveUsbOutput.isActive()
         usbExclusiveSinkActive = exclusive
@@ -3931,9 +3948,15 @@ class MusicPlayer @Inject constructor(
         }
         routedDacDeviceId = device?.id
         audioSinks.forEach { sink ->
-            runCatching { sink.setPreferredDevice(if (exclusive) null else device) }
-            runCatching { sink.setOutputSampleRateOverride(if (isSpatial) null else effectiveRateHz) }
-            runCatching { sink.setExclusiveFallbackRateHz(fallbackHz, effectiveRateHz) }
+            val isLiveSink = activeSink == null || sink === activeSink
+            if (isLiveSink) {
+                runCatching { sink.setPreferredDevice(if (exclusive) null else device) }
+                runCatching { sink.setOutputSampleRateOverride(if (isSpatial) null else effectiveRateHz) }
+                runCatching { sink.setExclusiveFallbackRateHz(fallbackHz, effectiveRateHz) }
+            } else {
+                runCatching { sink.setPreferredDevice(null) }
+                runCatching { sink.setOutputSampleRateOverride(null) }
+            }
         }
         android.util.Log.i(
             "MusicPlayer",
@@ -7015,7 +7038,7 @@ class MusicPlayer @Inject constructor(
 
             if (cached != null && identity != null) {
                 val fastLossless = runCatching {
-                    withTimeoutOrNull(350L) { losslessDeferred.await() }
+                    withTimeoutOrNull(150L) { losslessDeferred.await() }
                 }.getOrNull()
                 if (fastLossless != null) {
                     activeUpgradeDeferred = null
@@ -7060,7 +7083,7 @@ class MusicPlayer @Inject constructor(
                         localQuick.cancel()
                         val ytStream = youtube.await()
                         val elapsed = SystemClock.elapsedRealtime() - startMs
-                        val remainingGrace = (1_500L - elapsed).coerceIn(0L, 400L)
+                        val remainingGrace = (1_000L - elapsed).coerceIn(0L, 250L)
                         if (remainingGrace > 0L && !losslessDeferred.isCompleted) {
                             val quickLossless = runCatching {
                                 withTimeoutOrNull(remainingGrace) { losslessDeferred.await() }

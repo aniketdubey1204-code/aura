@@ -99,6 +99,7 @@ class DualDeckTransportCoordinator @Inject constructor(
         currentSecondaryPlayer = secondaryPlayer
 
         if (currentTrack == null || durationMs <= 0L) return
+        if (primaryPlayer.repeatMode == Player.REPEAT_MODE_ONE) return
 
         // If a blend is actively running, do not interfere with the transition in progress
         if (activeSpliceJob?.isActive == true) {
@@ -242,8 +243,6 @@ class DualDeckTransportCoordinator @Inject constructor(
         currentSecondaryPlayer = secondaryPlayer
         val durationMs = plan.durationMs.coerceAtLeast(1000L)
 
-        primaryPlayer.repeatMode = Player.REPEAT_MODE_OFF
-
         _telemetry.update {
             it.copy(
                 phase = if (plan.requiresPhraseLoop) BlendPhase.LOOP_LOCKED else BlendPhase.BLENDING,
@@ -294,7 +293,7 @@ class DualDeckTransportCoordinator @Inject constructor(
                     Pair(gOut, gIn)
                 }
                 val sum = gainIn + gainOut
-                val trim = if (sum <= 1f) 1f else 1f / kotlin.math.sqrt(sum)
+                val trim = if (sum <= 1f || gainIn <= 0.02f) 1f else 1f / kotlin.math.sqrt(sum)
                 primaryPlayer.volume = (gainOut * trim * baseVolume).coerceIn(0f, 1f)
                 secondaryPlayer.volume = (gainIn * trim * baseVolume).coerceIn(0f, 1f)
 

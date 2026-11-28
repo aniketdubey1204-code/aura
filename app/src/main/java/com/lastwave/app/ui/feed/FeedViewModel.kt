@@ -251,8 +251,11 @@ class FeedViewModel @Inject constructor(
         feedJob = viewModelScope.launch {
             val self = coroutineContext[Job]
             _uiState.update {
+                val alreadyHasContent = it.feedData.nativeShelves.isNotEmpty() ||
+                    it.feedData.quickPicks.isNotEmpty() ||
+                    it.feedData.charts.isNotEmpty()
                 it.copy(
-                    isLoading = !refreshing || it.isLoading,
+                    isLoading = !alreadyHasContent && (!refreshing || it.isLoading),
                     isRefreshing = refreshing,
                     error = null,
                     selectedChip = if (refreshing) null else it.selectedChip,

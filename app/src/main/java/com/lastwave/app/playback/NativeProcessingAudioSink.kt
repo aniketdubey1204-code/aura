@@ -84,6 +84,8 @@ class NativeProcessingAudioSink(
     private var processedFormat: Format? = null
     private var outputChannelCount = 2
 
+    private var hasSetPreferredDevice = false
+    private var lastPreferredDeviceId: Int? = null
     private var pendingInputLimit = 0
     private var pendingOutput: ByteBuffer? = null
     @Volatile
@@ -809,6 +811,10 @@ class NativeProcessingAudioSink(
     }
 
     override fun setPreferredDevice(audioDeviceInfo: AudioDeviceInfo?) {
+        val targetId = audioDeviceInfo?.id
+        if (hasSetPreferredDevice && lastPreferredDeviceId == targetId) return
+        hasSetPreferredDevice = true
+        lastPreferredDeviceId = targetId
         usbOutput?.setDevice(audioDeviceInfo)
         enhancedDelegate.setPreferredDevice(audioDeviceInfo)
         fallbackDelegate.setPreferredDevice(audioDeviceInfo)

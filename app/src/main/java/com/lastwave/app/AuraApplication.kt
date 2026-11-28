@@ -63,15 +63,13 @@ class AuraApplication : Application(), ImageLoaderFactory {
         // On-demand lyric translation/romanization keeps its bounded result
         // cache under the app cache directory so Android may reclaim it.
         runCatching { com.lastwave.app.data.lyrics.LyricsTranslation.cacheDir = cacheDir }
-        // First-song OPUS warmup: visitorData + NewPipe + BotGuard must be
-        // ready before the first tap, not 2.5s after. Immediate and never
-        // throws; the delayed block below keeps the rest lazy.
+        runCatching { com.lastwave.app.data.music.InnerTubeMusicApi.diskCacheDir = cacheDir }
+        // First-song OPUS warmup: visitorData + NewPipe + BotGuard warm in
+        // parallel so first tap never waits behind sequential init.
         applicationScope.launch(Dispatchers.IO) {
-            // NewPipe is optional fallback infrastructure. A broken extractor
-            // install must not escape an application-scope coroutine.
             runCatching { streamExtractor.get().preWarm() }
-            // Warm the InnerTube web config (visitor data) so the first
-            // playback's direct-URL fast path can attach it immediately.
+        }
+        applicationScope.launch(Dispatchers.IO) {
             runCatching { innerTubeMusicApi.get().preWarmPlayback() }
         }
         applicationScope.launch(Dispatchers.IO) {
